@@ -1,0 +1,12 @@
+.git
+.git/**
+.github
+.github/**
+tests
+tests/**
+README.md
+NOTICE.md
+.hermes
+.hermes/**
+.worktrees
+.worktrees/**
