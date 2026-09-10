@@ -148,11 +148,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/wujun8/speedtest-diy
-      DOCKER_CONFIG: ${{ runner.temp }}/speedtest-diy-anonymous-docker-config
     steps:
       - name: Pull and run GHCR image anonymously
         run: |
           set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/speedtest-diy-anonymous-docker-config"
           rm -rf -- "$DOCKER_CONFIG"
           mkdir -p -- "$DOCKER_CONFIG"
           unset DOCKER_AUTH_CONFIG

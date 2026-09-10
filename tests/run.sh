@@ -115,7 +115,7 @@ anonymous_ghcr_contract() {
         "github.event_name == 'push'" \
         "github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')" \
         'IMAGE: ghcr.io/wujun8/speedtest-diy' \
-        'DOCKER_CONFIG:' \
+        'export DOCKER_CONFIG="$RUNNER_TEMP/speedtest-diy-anonymous-docker-config"' \
         'unset DOCKER_AUTH_CONFIG' \
         'GITHUB_SHA::7' \
         'docker pull --platform linux/amd64' \
@@ -130,6 +130,10 @@ anonymous_ghcr_contract() {
             return 1
         fi
     done
+    if grep -Fq -- '${{ runner.temp }}' <<<"$job"; then
+        printf 'FAIL: anonymous GHCR job uses forbidden runner context\n' >&2
+        return 1
+    fi
     if grep -Fq -- 'docker/login-action' <<<"$job" ||
         grep -Fq -- 'docker login' <<<"$job"; then
         printf 'FAIL: anonymous GHCR job performs a registry login\n' >&2
