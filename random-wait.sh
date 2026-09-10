@@ -97,7 +97,7 @@ wait_for_next_run() {
     local seconds
 
     seconds=$(sample_wait_seconds) || return 1
-    printf 'Attente de %s secondes avant de relancer les tests...\n' "$seconds"
+    printf 'Waiting %s seconds before running the tests again...\n' "$seconds"
     sleep "$seconds" &
     sleep_pid=$!
     wait "$sleep_pid"

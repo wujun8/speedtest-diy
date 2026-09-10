@@ -79,9 +79,15 @@ workflow_contract() {
     require_line "$file" 'WAIT_TIME=30' 'signal smoke fixed wait' || return 1
     require_line "$file" 'timeout 10s docker stop --time 5' 'bounded SIGTERM smoke' || return 1
     require_line "$file" 'ghcr.io/wujun8/speedtest-diy' 'GHCR image path' || return 1
+    require_line "$file" 'Starting in 5 seconds...' 'English initial smoke marker' || return 1
+    require_line "$file" 'Direct speed test disabled.' 'English direct-disabled smoke marker' || return 1
+    require_line "$file" 'Proxy speed test disabled.' 'English proxy-disabled smoke marker' || return 1
+    require_line "$file" 'URL_DDL is empty. Download skipped.' 'English empty-URL smoke marker' || return 1
+    require_line "$file" 'Waiting 30 seconds before running the tests again...' 'English wait smoke marker' || return 1
     require_line "$file" 'type=raw,value=latest' 'latest tag rule' || return 1
     require_line "$file" 'type=sha,format=short' 'sha tag rule' || return 1
     require_line "$file" 'type=semver,pattern={{version}}' 'semver tag rule' || return 1
+    require_no_line "$file" 'Attente de 30 secondes' 'French wait smoke marker' || return 1
     require_line "$file" "github.event_name == 'push'" 'publish push guard' || return 1
     require_line "$file" 'needs: build-and-smoke' 'publish dependency' || return 1
     require_line "$file" 'docker/build-push-action' 'publish build action' || return 1
@@ -124,6 +130,7 @@ anonymous_ghcr_contract() {
         'RUN_SPEEDTEST_PROXY=false' \
         "URL_DDL=''" \
         'WAIT_TIME=30' \
+        'Waiting 30 seconds before running the tests again...' \
         'timeout 10s docker stop --time 5'; do
         if ! grep -Fq -- "$needle" <<<"$job"; then
             printf 'FAIL: anonymous GHCR contract (missing %s)\n' "$needle" >&2
@@ -169,7 +176,7 @@ compose_contract() {
         '    network_mode: host' \
         '    restart: unless-stopped' \
         '    environment:' \
-        '      URL_DDL: "${URL_DDL:-https://ai.here.link/assets/vendor-ui-KYGBtk6l.js}"' \
+        '      URL_DDL: "${URL_DDL:-https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz}"' \
         '      WAIT_TIME_MIN: "${WAIT_TIME_MIN:-5}"' \
         '      WAIT_TIME_MAX: "${WAIT_TIME_MAX:-50}"' \
         '      RUN_SPEEDTEST_DIRECT: "false"' \
@@ -181,6 +188,7 @@ compose_contract() {
             return 1
         fi
     done
+    require_no_line "$file" 'ai.here.link' 'Compose legacy ai.here.link URL' || return 1
     if grep -nE '^[[:space:]]*(ports|volumes):' "$file"; then
         printf 'FAIL: Compose contract (ports/volumes are forbidden)\n' >&2
         return 1
@@ -225,6 +233,11 @@ documentation_contract() {
         '关闭两类 cf_speedtest' 'host 网络访问本机 9100 代理' \
         '不挂载 volumes' '只支持 linux/amd64' \
         '5 秒' '2147483647' 'sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' \
+        'https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz' \
+        'GitHub CLI' 'v2.100.0' 'immutable' '15152253' \
+        'sha256:e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be' \
+        'Range' '206' 'bytes 0-0/15152253' \
+        '上游脚本产生的用户可见自有运行日志统一为英文' \
         'Docker Hub API' 'source' '公开描述未声明许可证' \
         'verify-public-pull' 'docker pull' 'docker run' '匿名' 'Public'; do
         require_line "$file" "$needle" "README contract" || return 1

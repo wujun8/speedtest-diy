@@ -8,6 +8,8 @@
 - 上游只提供 `linux/amd64`；本项目不宣称支持 arm64。目标运行环境示例为 Debian x86_64。
 - 构建期会校验上游 `/entrypoint.sh` 的 SHA256：`4ce13988639aba6ba591b5025023ef13b8db23490bbfcd96167e492a7f8e1f9d`。上游入口漂移或内容变化时构建 fail-closed，不会静默套用补丁。
 - `URL_DDL` 继续使用上游的 `proxychains4 wget ... -O /dev/null` 逻辑，不保存下载响应文件。
+- Compose 默认 `URL_DDL` 固定为 `https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz`。GitHub CLI release `v2.100.0` API 标记为 `immutable`；已核验资产大小为 `15152253` bytes，asset digest 为 `sha256:e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be`，一字节 Range 实测返回 `206`，`Content-Range: bytes 0-0/15152253`。
+- 上游脚本产生的用户可见自有运行日志统一为英文；源码注释以及 `cf_speedtest`、`proxychains4`、`wget` 的第三方输出不翻译。
 
 ## 构建与运行
 
@@ -87,7 +89,7 @@ docker run --rm --platform linux/amd64 --network host \
 | `UPLOAD_THREADS` | `4` | 上游直连/代理测速的上传线程数。 |
 | `RUN_SPEEDTEST_DIRECT` | `true` | 为 `true` 时运行直连测速；其他值保持上游的禁用语义。 |
 | `RUN_SPEEDTEST_PROXY` | `true` | 为 `true` 时通过 `proxychains4` 运行代理测速；其他值保持上游的禁用语义。 |
-| `URL_DDL` | 空 | 非空时按上游逻辑通过代理下载，并把内容写入 `/dev/null`；为空则跳过。 |
+| `URL_DDL` | Compose 默认 GitHub CLI 固定资产 URL | 非空时按上游逻辑通过代理下载，并把内容写入 `/dev/null`；为空则跳过。 |
 
 除等待 seam 外，上述上游变量、测速命令、代理配置和 URL_DDL 语义不变。请注意：测速和下载会产生真实网络流量，频繁的 5～50 秒默认间隔可能消耗带宽、流量配额并触发服务端限流；请按网络、代理和 Cloudflare 服务条款选择间隔。
 

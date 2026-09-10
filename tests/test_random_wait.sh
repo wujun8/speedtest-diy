@@ -23,6 +23,13 @@ assert_contains() {
     esac
 }
 
+assert_not_contains() {
+    local haystack=$1 needle=$2 label=$3
+    case "$haystack" in
+        *"$needle"*) fail "$label (unexpected '$needle')" ;;
+    esac
+}
+
 SCRIPT=$ROOT/random-wait.sh
 if [ ! -f "$SCRIPT" ]; then
     fail "random-wait.sh is missing"
@@ -65,7 +72,10 @@ chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
     sampled=$(sample_wait_seconds) || exit 1
     assert_eq 17 "$sampled" "default sample"
     assert_eq '-i 5-50 -n 1' "$(<"$SHUF_LOG")" "default shuf range"
-    wait_for_next_run >/dev/null || exit 1
+    wait_output=$(wait_for_next_run) || exit 1
+    assert_contains "$wait_output" 'Waiting 17 seconds before running the tests again...' \
+        'English wait message' || exit 1
+    assert_not_contains "$wait_output" 'Attente de' 'French wait message' || exit 1
     assert_eq 17 "$(<"$SLEEP_LOG")" "default sleep seconds"
     if [ "${WAIT_TIME+x}" = x ]; then
         fail "random sampling assigned the legacy WAIT_TIME variable"

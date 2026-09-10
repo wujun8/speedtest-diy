@@ -83,19 +83,56 @@ jobs:
             docker rm -f "$container_id" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          logs=''
           reached_wait=false
           for _ in 1 2 3 4 5 6 7 8 9 10; do
-            if docker logs "$container_id" 2>&1 | grep -Fq -- 'Attente de 30 secondes'; then
+            logs=$(docker logs "$container_id" 2>&1 || true)
+            if grep -Fq -- 'Starting in 5 seconds...' <<<"$logs" &&
+                grep -Fq -- 'Direct speed test disabled.' <<<"$logs" &&
+                grep -Fq -- 'Proxy speed test disabled.' <<<"$logs" &&
+                grep -Fq -- 'URL_DDL is empty. Download skipped.' <<<"$logs" &&
+                grep -Fq -- 'Waiting 30 seconds before running the tests again...' <<<"$logs"; then
               reached_wait=true
               break
             fi
             sleep 1
           done
+          logs=$(docker logs "$container_id" 2>&1 || true)
           if [ "$reached_wait" != true ]; then
-            docker logs "$container_id" >&2 || true
-            printf '%s\n' 'container did not reach its wait interval' >&2
+            printf '%s\n' "$logs" >&2
+            printf '%s\n' 'container did not reach its English startup, disabled-test, empty-URL, and wait logs' >&2
             exit 1
           fi
+          for expected in \
+              'Starting in 5 seconds...' \
+              'Direct speed test disabled.' \
+              'Proxy speed test disabled.' \
+              'URL_DDL is empty. Download skipped.' \
+              'Waiting 30 seconds before running the tests again...'; do
+            if ! grep -Fq -- "$expected" <<<"$logs"; then
+              printf '%s\n' "missing expected log: $expected" >&2
+              printf '%s\n' "$logs" >&2
+              exit 1
+            fi
+          done
+          for forbidden in \
+              'Arrêt du script demandé.' \
+              'Lancement du test de vitesse en direct...' \
+              'Erreur : Échec du test de vitesse en direct' \
+              'Test de vitesse en direct désactivé.' \
+              'Lancement du test de vitesse via proxychains4...' \
+              'Erreur : Échec du test de vitesse via proxychains' \
+              'Test de vitesse via proxychains désactivé.' \
+              'Lancement du téléchargement depuis :' \
+              'La variable URL_DDL est vide. Téléchargement annulé.' \
+              'Démarrage dans 5 secondes...' \
+              'Attente de'; do
+            if grep -Fq -- "$forbidden" <<<"$logs"; then
+              printf '%s\n' "unexpected French user-visible log: $forbidden" >&2
+              printf '%s\n' "$logs" >&2
+              exit 1
+            fi
+          done
           timeout 10s docker stop --time 5 "$container_id"
           [ "$(docker inspect -f '{{.State.Running}}' "$container_id")" = false ]
 
@@ -170,7 +207,7 @@ jobs:
           trap cleanup EXIT
           reached_wait=false
           for _ in 1 2 3 4 5 6 7 8 9 10; do
-            if docker logs "$container_id" 2>&1 | grep -Fq -- 'Attente de 30 secondes'; then
+            if docker logs "$container_id" 2>&1 | grep -Fq -- 'Waiting 30 seconds before running the tests again...'; then
               reached_wait=true
               break
             fi
