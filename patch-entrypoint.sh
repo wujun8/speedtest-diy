@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_UPSTREAM_SHA256=4ce13988639aba6ba591b5025023ef13b8db23490bbfcd96167e492a7f8e1f9d
+EXPECTED_UPSTREAM_SHA256=${EXPECTED_UPSTREAM_SHA256:-4ce13988639aba6ba591b5025023ef13b8db23490bbfcd96167e492a7f8e1f9d}
 
 if [ "$#" -ne 1 ]; then
     printf 'usage: %s /path/to/upstream-entrypoint.sh\n' "$0" >&2

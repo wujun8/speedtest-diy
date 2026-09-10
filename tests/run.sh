@@ -39,6 +39,25 @@ require_no_line() {
     fi
 }
 
+portability_contract() {
+    local workspace_marker='/work''space/'
+    local hermes_fixture_marker='.git''/hermes-inputs'
+    local tracked_tests tracked_test
+
+    if ! tracked_tests=$(git -C "$ROOT" ls-files -- tests); then
+        printf 'FAIL: could not enumerate tracked tests\n' >&2
+        return 1
+    fi
+    while IFS= read -r tracked_test; do
+        [ -n "$tracked_test" ] || continue
+        if grep -nF -- "$workspace_marker" "$ROOT/$tracked_test" ||
+            grep -nF -- "$hermes_fixture_marker" "$ROOT/$tracked_test"; then
+            printf 'FAIL: non-portable fixture path in %s\n' "$tracked_test" >&2
+            return 1
+        fi
+    done <<<"$tracked_tests"
+}
+
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
     require_file "$file" || return 1
@@ -114,6 +133,7 @@ notice_contract() {
     require_line "$file" '自行核对上游条款' 'NOTICE terms reminder' || return 1
 }
 
+run_group 'test fixture portability' portability_contract
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
 run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"
 run_group 'workflow static contract' workflow_contract
