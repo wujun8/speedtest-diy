@@ -156,6 +156,61 @@ dockerfile_contract() {
     fi
 }
 
+compose_contract() {
+    local file=$ROOT/compose.yaml
+    local needle count
+
+    require_file "$file" || return 1
+    for needle in \
+        'services:' \
+        '  speedtest:' \
+        '    image: ghcr.io/wujun8/speedtest-diy:latest' \
+        '    platform: linux/amd64' \
+        '    network_mode: host' \
+        '    restart: unless-stopped' \
+        '    environment:' \
+        '      URL_DDL: "${URL_DDL:-https://ai.here.link/assets/vendor-ui-KYGBtk6l.js}"' \
+        '      WAIT_TIME_MIN: "${WAIT_TIME_MIN:-5}"' \
+        '      WAIT_TIME_MAX: "${WAIT_TIME_MAX:-50}"' \
+        '      RUN_SPEEDTEST_DIRECT: "false"' \
+        '      RUN_SPEEDTEST_PROXY: "false"' \
+        '      PROXY_CONFIG: "${PROXY_CONFIG:-socks5 127.0.0.1 9100}"'; do
+        count=$(grep -Fxc -- "$needle" "$file" 2>/dev/null || true)
+        if [ "$count" -ne 1 ]; then
+            printf 'FAIL: Compose contract (expected exactly one line: %s; found %s)\n' "$needle" "$count" >&2
+            return 1
+        fi
+    done
+    if grep -nE '^[[:space:]]*(ports|volumes):' "$file"; then
+        printf 'FAIL: Compose contract (ports/volumes are forbidden)\n' >&2
+        return 1
+    fi
+    if grep -nE '^[[:space:]]*-[[:space:]]*(URL_DDL|WAIT_TIME_MIN|WAIT_TIME_MAX|RUN_SPEEDTEST_DIRECT|RUN_SPEEDTEST_PROXY|PROXY_CONFIG)(:|[[:space:]])' "$file"; then
+        printf 'FAIL: Compose contract (environment must use a mapping)\n' >&2
+        return 1
+    fi
+
+    if [ "${CI:-}" = 'true' ]; then
+        if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+            printf 'FAIL: Compose contract (CI=true requires docker compose)\n' >&2
+            return 1
+        fi
+        if ! (CDPATH= cd -- "$ROOT" && docker compose -f compose.yaml config -q); then
+            printf 'FAIL: Compose contract (docker compose config -q failed in CI)\n' >&2
+            return 1
+        fi
+        printf 'PASS: docker compose config -q (CI)\n'
+    elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        if ! (CDPATH= cd -- "$ROOT" && docker compose -f compose.yaml config -q); then
+            printf 'FAIL: Compose contract (docker compose config -q failed)\n' >&2
+            return 1
+        fi
+        printf 'PASS: docker compose config -q\n'
+    else
+        printf 'PASS: Compose static contract only (docker compose unavailable outside CI)\n'
+    fi
+}
+
 documentation_contract() {
     local file=$ROOT/README.md
     require_file "$file" || return 1
@@ -164,6 +219,11 @@ documentation_contract() {
         'TEST_DURATION' 'DOWNLOAD_THREADS' 'UPLOAD_THREADS' \
         'RUN_SPEEDTEST_DIRECT' 'RUN_SPEEDTEST_PROXY' 'URL_DDL' \
         '5～50' 'ghcr.io/wujun8/speedtest-diy' 'Debian x86_64' \
+        'Compose 仅 URL_DDL 下载' 'docker compose up -d' \
+        'docker compose logs -f speedtest' 'docker compose stop' \
+        '创建本地 .env' '默认等待范围为 5～50 秒' \
+        '关闭两类 cf_speedtest' 'host 网络访问本机 9100 代理' \
+        '不挂载 volumes' '只支持 linux/amd64' \
         '5 秒' '2147483647' 'sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' \
         'Docker Hub API' 'source' '公开描述未声明许可证' \
         'verify-public-pull' 'docker pull' 'docker run' '匿名' 'Public'; do
@@ -186,6 +246,7 @@ run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"
 run_group 'workflow static contract' workflow_contract
 run_group 'anonymous GHCR pull/run static contract' anonymous_ghcr_contract
 run_group 'Dockerfile static contract' dockerfile_contract
+run_group 'Compose static contract' compose_contract
 run_group 'README static contract' documentation_contract
 run_group 'NOTICE static contract' notice_contract
 

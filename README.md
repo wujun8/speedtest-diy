@@ -23,6 +23,27 @@ docker run --rm --platform linux/amd64 --network host \
   ghcr.io/wujun8/speedtest-diy:local
 ```
 
+## Compose 仅 URL_DDL 下载
+
+`compose.yaml` 提供一个可用 `.env` 覆盖的运行预设：默认等待范围为 5～50 秒，关闭两类 cf_speedtest（`RUN_SPEEDTEST_DIRECT=false` 和 `RUN_SPEEDTEST_PROXY=false`），只保留上游 `URL_DDL` 下载。启动、查看日志和停止：
+
+```bash
+docker compose up -d
+docker compose logs -f speedtest
+docker compose stop
+```
+
+在同目录创建本地 .env（不要提交该文件）即可覆盖 URL、等待范围和代理配置，例如：
+
+```dotenv
+URL_DDL=https://example.invalid/assets/test.bin
+WAIT_TIME_MIN=10
+WAIT_TIME_MAX=30
+PROXY_CONFIG="socks5 127.0.0.1 9100"
+```
+
+此预设使用 `network_mode: host`，依赖 host 网络访问本机 9100 代理；默认只支持 linux/amd64。上游 `URL_DDL` 仍经 `proxychains4` 下载，内容写入 `/dev/null`，不落盘；Compose 不挂载 volumes，也不发布 ports。这里的“只下载”不代表直连下载，不能修改为绕过 `proxychains4`。
+
 首次启动仍固定等待 **5 秒**，然后执行一轮启用的直连测速、代理测速和下载测试。只有整轮结束后才会重新独立采样下一次等待秒数；随机值是含边界的均匀整数。
 
 ## 等待间隔变量与优先级
