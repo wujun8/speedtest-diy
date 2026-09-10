@@ -95,6 +95,48 @@ workflow_contract() {
     fi
 }
 
+anonymous_ghcr_contract() {
+    local file=$ROOT/.github/workflows/container.yml
+    local job
+
+    require_file "$file" || return 1
+    job=$(awk '
+        /^  verify-public-pull:/ { in_job=1 }
+        in_job && /^  [[:alnum:]_-]+:/ && $0 !~ /^  verify-public-pull:/ { exit }
+        in_job { print }
+    ' "$file")
+    if [ -z "$job" ]; then
+        printf 'FAIL: anonymous GHCR verification job is missing\n' >&2
+        return 1
+    fi
+    for needle in \
+        'name: Verify anonymous GHCR pull and run' \
+        'needs: publish' \
+        "github.event_name == 'push'" \
+        "github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')" \
+        'IMAGE: ghcr.io/wujun8/speedtest-diy' \
+        'DOCKER_CONFIG:' \
+        'unset DOCKER_AUTH_CONFIG' \
+        'GITHUB_SHA::7' \
+        'docker pull --platform linux/amd64' \
+        'docker run -d --platform linux/amd64' \
+        'RUN_SPEEDTEST_DIRECT=false' \
+        'RUN_SPEEDTEST_PROXY=false' \
+        "URL_DDL=''" \
+        'WAIT_TIME=30' \
+        'timeout 10s docker stop --time 5'; do
+        if ! grep -Fq -- "$needle" <<<"$job"; then
+            printf 'FAIL: anonymous GHCR contract (missing %s)\n' "$needle" >&2
+            return 1
+        fi
+    done
+    if grep -Fq -- 'docker/login-action' <<<"$job" ||
+        grep -Fq -- 'docker login' <<<"$job"; then
+        printf 'FAIL: anonymous GHCR job performs a registry login\n' >&2
+        return 1
+    fi
+}
+
 dockerfile_contract() {
     local file=$ROOT/Dockerfile
     require_file "$file" || return 1
@@ -119,7 +161,8 @@ documentation_contract() {
         'RUN_SPEEDTEST_DIRECT' 'RUN_SPEEDTEST_PROXY' 'URL_DDL' \
         '5～50' 'ghcr.io/wujun8/speedtest-diy' 'Debian x86_64' \
         '5 秒' '2147483647' 'sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' \
-        'Docker Hub API' 'source' '公开描述未声明许可证'; do
+        'Docker Hub API' 'source' '公开描述未声明许可证' \
+        'verify-public-pull' 'docker pull' 'docker run' '匿名' 'Public'; do
         require_line "$file" "$needle" "README contract" || return 1
     done
 }
@@ -137,6 +180,7 @@ run_group 'test fixture portability' portability_contract
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
 run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"
 run_group 'workflow static contract' workflow_contract
+run_group 'anonymous GHCR pull/run static contract' anonymous_ghcr_contract
 run_group 'Dockerfile static contract' dockerfile_contract
 run_group 'README static contract' documentation_contract
 run_group 'NOTICE static contract' notice_contract

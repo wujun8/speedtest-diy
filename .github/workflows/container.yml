@@ -138,3 +138,48 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  verify-public-pull:
+    name: Verify anonymous GHCR pull and run
+    needs: publish
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/wujun8/speedtest-diy
+      DOCKER_CONFIG: ${{ runner.temp }}/speedtest-diy-anonymous-docker-config
+    steps:
+      - name: Pull and run GHCR image anonymously
+        run: |
+          set -euo pipefail
+          rm -rf -- "$DOCKER_CONFIG"
+          mkdir -p -- "$DOCKER_CONFIG"
+          unset DOCKER_AUTH_CONFIG
+          image="$IMAGE:sha-${GITHUB_SHA::7}"
+          docker pull --platform linux/amd64 "$image"
+          container_id=$(docker run -d --platform linux/amd64 \
+            -e RUN_SPEEDTEST_DIRECT=false \
+            -e RUN_SPEEDTEST_PROXY=false \
+            -e URL_DDL='' \
+            -e WAIT_TIME=30 \
+            "$image")
+          cleanup() {
+            docker rm -f "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          reached_wait=false
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if docker logs "$container_id" 2>&1 | grep -Fq -- 'Attente de 30 secondes'; then
+              reached_wait=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$reached_wait" != true ]; then
+            docker logs "$container_id" >&2 || true
+            printf '%s\n' 'anonymous GHCR image did not reach its wait interval' >&2
+            exit 1
+          fi
+          timeout 10s docker stop --time 5 "$container_id"
+          [ "$(docker inspect -f '{{.State.Running}}' "$container_id")" = false ]

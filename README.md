@@ -83,3 +83,12 @@ docker run --rm --platform linux/amd64 --network host \
 - semver 标签（例如 `v1.2.3` 生成 `1.2.3` 及对应 semver 变体）。
 
 镜像构建和 smoke 都明确使用 `linux/amd64`。smoke 会验证默认 5～50、边界区间、旧 `WAIT_TIME` 固定间隔、非法配置 fail-fast，以及补丁 marker。
+
+### 发布后匿名验收
+
+发布 job 成功后，`verify-public-pull` 会在不执行任何 GHCR 登录的前提下，用临时空的 `DOCKER_CONFIG` 匿名执行：
+
+1. `docker pull` 发布的 `sha-<7 位提交短 SHA>` 标签；
+2. `docker run` 该镜像，关闭真实测速和下载，只验证入口脚本能进入等待区间并能在 SIGTERM 后退出。
+
+这一步验证的是发布后的公开镜像，而不是本地 build 产物。GHCR package 必须设置为 **Public**，否则匿名 `docker pull` 会失败；Actions workflow 不会替你修改 package 可见性。验收仍明确限定为 `linux/amd64`。
