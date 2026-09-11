@@ -145,7 +145,7 @@ $0 == old_direct_start {
     print "        if [ \"$SPEEDTEST_DOWNLOAD_ONLY\" = \"true\" ]; then"
     print "            echo -e \"${GREEN}${BOLD}Starting direct speed test (download-only, ${TEST_DURATION} sec)${RESET}\""
     print "        else"
-    print "            echo -e \"${GREEN}${BOLD}Starting direct speed test (download and upload, ${TEST_DURATION} sec)${RESET}\""
+    print "            echo -e \"${GREEN}${BOLD}Starting direct speed test (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
     print "        fi"
     direct_start_count++
     next
@@ -165,7 +165,7 @@ $0 == old_proxy_start {
     print "            if [ \"$SPEEDTEST_DOWNLOAD_ONLY\" = \"true\" ]; then"
     print "                echo -e \"${BLUE}${BOLD}Starting speed test through proxychains4 (download-only, ${TEST_DURATION} sec)${RESET}\""
     print "            else"
-    print "                echo -e \"${BLUE}${BOLD}Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec)${RESET}\""
+    print "                echo -e \"${BLUE}${BOLD}Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
     print "            fi"
     print "        fi"
     proxy_start_count++
