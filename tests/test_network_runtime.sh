@@ -41,6 +41,8 @@ range=''
 header_file=''
 write_out=''
 previous=''
+silent=false
+show_error=false
 for arg in "$@"; do
   if [[ "$previous" == '--output' || "$previous" == '-o' ]]; then
     output=$arg
@@ -52,6 +54,8 @@ for arg in "$@"; do
     write_out=$arg
   fi
   case "$arg" in
+    --silent|-s) silent=true; previous='' ;;
+    --show-error|-S) show_error=true; previous='' ;;
     --output|-o) previous="$arg" ;;
     --range|-r) previous="$arg" ;;
     --dump-header|-D) previous="$arg" ;;
@@ -85,6 +89,10 @@ fi
 if [[ -z "$header_file" || -z "$write_out" ]]; then
   printf 'fake curl requires --dump-header and --write-out metadata\n' >&2
   exit 91
+fi
+if [[ "$silent" != true || "$show_error" != true ]]; then
+  printf 'fake curl requires --silent and --show-error\n' >&2
+  exit 92
 fi
 
 total=${FAKE_TOTAL:-101}

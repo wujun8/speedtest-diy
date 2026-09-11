@@ -45,8 +45,10 @@ _nr_pid_running() {
     proc_stat=$(<"/proc/$pid/stat") || return 0
     proc_stat=${proc_stat##*) }
     state=${proc_stat%% *}
-    [[ $state != Z ]]
-    return
+    if [[ $state == Z ]]; then
+      return 1
+    fi
+    return 0
   fi
   return 0
 }
@@ -176,7 +178,7 @@ _nr_start_curl() {
   local -a curl_args
   local pid
 
-  curl_args=(--fail --location)
+  curl_args=(--fail --location --silent --show-error)
   if [[ -n $range ]]; then
     curl_args+=(--range "$range")
   fi
