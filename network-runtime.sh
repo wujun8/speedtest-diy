@@ -5,6 +5,8 @@
 _NR_RUNTIME_DIR=
 _NR_ACTIVE_PIDS=()
 _NR_LAST_PID=
+_NR_START_IN_PROGRESS=0
+_NR_START_PREV_PID=
 
 _nr_create_runtime_dir() {
   local tmpdir=${TMPDIR:-/tmp}
@@ -32,6 +34,8 @@ _nr_cleanup_runtime() {
   _nr_remove_runtime_dir "$runtime_dir"
   _NR_RUNTIME_DIR=
   _NR_ACTIVE_PIDS=()
+  _NR_START_IN_PROGRESS=0
+  _NR_START_PREV_PID=
 }
 
 _nr_pid_running() {
@@ -68,11 +72,15 @@ _nr_wait_for_pid_exit() {
 }
 
 _nr_run_tracked() {
-  local pid rc
+  local pid rc prior_pid
 
+  prior_pid=${!:-}
+  _NR_START_PREV_PID=$prior_pid
+  _NR_START_IN_PROGRESS=1
   "$@" &
   pid=$!
   _NR_ACTIVE_PIDS+=("$pid")
+  _NR_START_IN_PROGRESS=0
   if wait "$pid"; then
     rc=0
   else
@@ -86,7 +94,27 @@ cancel_network_runtime() {
   local pid
   local attempt
   local any_running
+  local current_pid
+  local prior_pid
+  local already_tracked
   local -a active_pids=("${_NR_ACTIVE_PIDS[@]}")
+
+  if (( ${_NR_START_IN_PROGRESS:-0} != 0 )); then
+    current_pid=${!:-}
+    prior_pid=${_NR_START_PREV_PID-}
+    if [[ -n $current_pid && $current_pid != "$prior_pid" ]]; then
+      already_tracked=0
+      for pid in "${active_pids[@]}"; do
+        if [[ $pid == "$current_pid" ]]; then
+          already_tracked=1
+          break
+        fi
+      done
+      if (( already_tracked == 0 )); then
+        active_pids+=("$current_pid")
+      fi
+    fi
+  fi
 
   for pid in "${active_pids[@]}"; do
     kill -TERM "$pid" 2>/dev/null || :
@@ -193,6 +221,7 @@ _nr_start_curl() {
   local -a curl_args
   local -a clear_proxy_env
   local pid
+  local prior_pid
 
   clear_proxy_env=(
     env
@@ -217,6 +246,9 @@ _nr_start_curl() {
     "$url"
   )
 
+  prior_pid=${!:-}
+  _NR_START_PREV_PID=$prior_pid
+  _NR_START_IN_PROGRESS=1
   if [[ -n ${PROXY_CONFIG:-} ]]; then
     "${clear_proxy_env[@]}" proxychains4 curl "${curl_args[@]}" >"$metadata_file" &
   else
@@ -225,6 +257,7 @@ _nr_start_curl() {
   pid=$!
   _NR_ACTIVE_PIDS+=("$pid")
   _NR_LAST_PID=$pid
+  _NR_START_IN_PROGRESS=0
 }
 
 _nr_forget_pid() {

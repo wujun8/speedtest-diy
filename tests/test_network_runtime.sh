@@ -26,6 +26,12 @@ cleanup() {
       kill -KILL "$worker_pid" 2>/dev/null || :
     fi
   done
+  for marker in "$STATE"/registration-child-pid.* "$STATE"/race-curl-pid "$STATE"/race-worker-pid; do
+    if [[ -f "$marker" ]]; then
+      worker_pid=$(<"$marker")
+      kill -KILL "$worker_pid" 2>/dev/null || :
+    fi
+  done
   rm -rf "$STATE"
 }
 trap cleanup EXIT HUP INT TERM
@@ -133,6 +139,19 @@ fi
 if [[ "${FAKE_REQUIRE_URL_BOUNDARY:-false}" == 'true' && -z "$url" ]]; then
   printf 'fake curl requires an explicit -- before the URL\n' >&2
   exit 93
+fi
+
+if [[ "${FAKE_RACE_CURL:-false}" == 'true' ]]; then
+  printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
+  if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
+    line=''
+    term_count=0
+    trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-curl"' TERM INT
+    while :; do
+      IFS= read -r -t 0.05 line < /dev/zero || :
+    done
+  fi
+  exec sleep 60
 fi
 
 total=${FAKE_TOTAL:-101}
@@ -298,6 +317,24 @@ exit 0
 FAKE_CF
 chmod +x "$FAKE_BIN/cf_speedtest"
 
+cat > "$FAKE_BIN/race-worker" <<'FAKE_RACE'
+#!/usr/bin/env bash
+set -u
+
+: "${FAKE_STATE:?FAKE_STATE is required}"
+printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
+if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
+  line=''
+  term_count=0
+  trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-run"' TERM INT
+  while :; do
+    IFS= read -r -t 0.05 line < /dev/zero || :
+  done
+fi
+exec sleep 60
+FAKE_RACE
+chmod +x "$FAKE_BIN/race-worker"
+
 export PATH="$FAKE_BIN:$PATH"
 export FAKE_STATE="$STATE"
 export TMPDIR="$RUNTIME_TMP"
@@ -400,8 +437,11 @@ reset_fake_state() {
   : > "$STATE/cf.env"
   rm -f "$STATE"/started.* "$STATE"/worker-pid.* "$STATE"/barrier.calls "$STATE"/release-workers "$STATE"/trap-complete
   rm -f "$STATE"/cf-pid "$STATE"/release-cf "$STATE"/cf-trap-complete
+  rm -f "$STATE"/registration-child-pid.* "$STATE"/registration-complete.* \
+    "$STATE"/race-curl-pid "$STATE"/race-worker-pid "$STATE"/race-term-count-*
   unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS
   unset FAKE_BAD_RANGE FAKE_FAIL_RANGE FAKE_CF_FAIL FAKE_CF_HOLD FAKE_REQUIRE_URL_BOUNDARY
+  unset FAKE_RACE_CURL FAKE_RACE_DEDUPE
   unset FAKE_VIA_PROXY PROXYCHAINS_CONF_FILE
 }
 
@@ -418,7 +458,99 @@ run_capture() {
 
 count_lines() {
   local file=$1
+  if [[ ! -e "$file" ]]; then
+    printf '0\n'
+    return 0
+  fi
   awk 'END { print NR + 0 }' "$file"
+}
+
+registration_debug_probe() {
+  local command=$BASH_COMMAND
+  local should_signal=0
+
+  case "${REGISTRATION_TRIGGER:-}" in
+    run-after|curl-after)
+      [[ $command == 'pid=$!' ]] && should_signal=1
+      ;;
+    run-before)
+      [[ $command == *'$@'* ]] && should_signal=1
+      ;;
+    curl-before)
+      [[ $command == *'clear_proxy_env'* && $command == *curl* ]] && should_signal=1
+      ;;
+    run-dedupe)
+      [[ $command == 'wait "$pid"' || $command == '_NR_START_IN_PROGRESS=0' ]] && should_signal=1
+      ;;
+    curl-dedupe)
+      [[ $command == '_NR_LAST_PID=$pid' || $command == '_NR_START_IN_PROGRESS=0' ]] && should_signal=1
+      ;;
+  esac
+
+  if (( should_signal != 0 )); then
+    printf '%s\n' "${!:-}" > "${REGISTRATION_MARKER:?}"
+    trap - DEBUG
+    if [[ ${REGISTRATION_TRIGGER:-} == run-dedupe ]]; then
+      for attempt in $(seq 1 300); do
+        [[ -f "$FAKE_STATE/race-worker-pid" ]] && break
+        sleep 0.01
+      done
+    elif [[ ${REGISTRATION_TRIGGER:-} == curl-dedupe ]]; then
+      for attempt in $(seq 1 300); do
+        [[ -f "$FAKE_STATE/race-curl-pid" ]] && break
+        sleep 0.01
+      done
+    fi
+    kill -TERM "$BASHPID"
+  fi
+}
+
+wait_for_pid_stop() {
+  local pid=$1
+  local attempt state
+
+  for attempt in $(seq 1 300); do
+    if [[ ! -r "/proc/$pid/stat" ]]; then
+      return 0
+    fi
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    if [[ $state == Z ]]; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  kill -KILL "$pid" 2>/dev/null || :
+  wait "$pid" 2>/dev/null || :
+  fail "process did not exit within the bound: $pid"
+}
+
+assert_pid_stopped() {
+  local pid=$1
+  local state
+
+  if [[ -r "/proc/$pid/stat" ]]; then
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    [[ $state == Z ]] || fail "process is still live: $pid (state=$state)"
+  elif kill -0 "$pid" 2>/dev/null; then
+    fail "process is still live without a /proc state: $pid"
+  fi
+}
+
+assert_pid_live() {
+  local pid=$1
+  local state
+
+  kill -0 "$pid" 2>/dev/null || fail "process unexpectedly stopped: $pid"
+  if [[ -r "/proc/$pid/stat" ]]; then
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    [[ $state != Z ]] || fail "process is a zombie: $pid"
+  fi
+}
+
+stop_pid() {
+  local pid=$1
+  kill -TERM "$pid" 2>/dev/null || :
+  wait "$pid" 2>/dev/null || :
 }
 
 assert_all_curl_outputs_are_dev_null() {
@@ -720,6 +852,152 @@ fi
 assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'status mismatch did not harvest all workers'
 assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'response mismatches triggered a complete download'
 pass 'worker failures and response status/size/range mismatches fail overall'
+
+# Deterministic RED/GREEN coverage for the async PID-registration window.
+reset_fake_state
+unset PROXY_CONFIG
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=run-after
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-after"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-after-trap\\n" > "$FAKE_STATE/registration-complete.run-after"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-after.out" 2>"$STATE/run-after.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked registration-window trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail 'run_tracked registration-window trap did not capture the just-started PID'
+[[ -f "$STATE/registration-complete.run-after" ]] || fail 'run_tracked registration-window trap did not complete cleanup'
+assert_eq '1' "$(count_lines "$STATE/registration-complete.run-after")" 'run_tracked registration-window trap completed more than once'
+registered_pid=$(<"$REGISTRATION_MARKER")
+[[ "$registered_pid" != "$unrelated_pid" ]] || fail 'run_tracked registration-window captured the prior unrelated PID'
+assert_pid_stopped "$registered_pid"
+assert_pid_live "$unrelated_pid"
+stop_pid "$unrelated_pid"
+pass 'run_tracked closes the deterministic post-launch registration window'
+
+reset_fake_state
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=run-before
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-before"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-before-trap\\n" > "$FAKE_STATE/registration-complete.run-before"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-before.out" 2>"$STATE/run-before.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked pre-launch trap did not exit with 143'
+assert_eq "$unrelated_pid" "$(<"$REGISTRATION_MARKER")" 'run_tracked pre-launch signal did not observe the prior PID'
+assert_pid_live "$unrelated_pid"
+assert_eq '0' "$(count_lines "$STATE/race-worker-pid")" 'run_tracked launched a worker after the pre-launch signal'
+stop_pid "$unrelated_pid"
+pass 'run_tracked pre-launch cleanup preserves the prior unrelated PID'
+
+reset_fake_state
+unset PROXY_CONFIG
+export FAKE_RACE_CURL=true
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=curl-after
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-after"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-after-trap\\n" > "$FAKE_STATE/registration-complete.curl-after"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-after.out" 2>"$STATE/curl-after.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl registration-window trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail '_nr_start_curl registration-window trap did not capture the just-started PID'
+registered_pid=$(<"$REGISTRATION_MARKER")
+[[ "$registered_pid" != "$unrelated_pid" ]] || fail '_nr_start_curl registration-window captured the prior unrelated PID'
+assert_pid_stopped "$registered_pid"
+assert_pid_live "$unrelated_pid"
+stop_pid "$unrelated_pid"
+pass '_nr_start_curl closes the deterministic post-launch registration window'
+
+reset_fake_state
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=curl-before
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-before"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-before-trap\\n" > "$FAKE_STATE/registration-complete.curl-before"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-before.out" 2>"$STATE/curl-before.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl pre-launch trap did not exit with 143'
+assert_eq "$unrelated_pid" "$(<"$REGISTRATION_MARKER")" '_nr_start_curl pre-launch signal did not observe the prior PID'
+assert_pid_live "$unrelated_pid"
+assert_eq '0' "$(count_lines "$STATE/curl.calls")" '_nr_start_curl launched curl after the pre-launch signal'
+stop_pid "$unrelated_pid"
+pass '_nr_start_curl pre-launch cleanup preserves the prior unrelated PID'
+
+reset_fake_state
+export FAKE_RACE_DEDUPE=true
+REGISTRATION_TRIGGER=run-dedupe
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-dedupe"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-dedupe-trap\\n" > "$FAKE_STATE/registration-complete.run-dedupe"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-dedupe.out" 2>"$STATE/run-dedupe.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked post-append trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail 'run_tracked post-append trap did not capture the PID'
+assert_pid_stopped "$(<"$REGISTRATION_MARKER")"
+[[ -f "$STATE/race-term-count-run" ]] || fail 'run_tracked post-append trap did not reach the fake child TERM handler'
+assert_eq '1' "$(<"$STATE/race-term-count-run")" 'run_tracked sent duplicate TERM signals to a registered PID'
+pass 'run_tracked deduplicates a PID already appended before start-state clear'
+
+reset_fake_state
+export FAKE_RACE_CURL=true FAKE_RACE_DEDUPE=true
+REGISTRATION_TRIGGER=curl-dedupe
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-dedupe"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-dedupe-trap\\n" > "$FAKE_STATE/registration-complete.curl-dedupe"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-dedupe.out" 2>"$STATE/curl-dedupe.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl post-append trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail '_nr_start_curl post-append trap did not capture the PID'
+assert_pid_stopped "$(<"$REGISTRATION_MARKER")"
+[[ -f "$STATE/race-term-count-curl" ]] || fail '_nr_start_curl post-append trap did not reach the fake child TERM handler'
+assert_eq '1' "$(<"$STATE/race-term-count-curl")" '_nr_start_curl sent duplicate TERM signals to a registered PID'
+pass '_nr_start_curl deduplicates a PID already appended before start-state clear'
 
 # Caller-owned TERM cleanup must terminate and reap every held worker and remove the private directory.
 reset_fake_state
