@@ -44,10 +44,18 @@ fi
 
 TMP_DIR=$(mktemp -d)
 cleanup() {
+    local pid_file sleep_pid
     if [ -n "${WAIT_LIFECYCLE_PID:-}" ]; then
         kill -KILL "$WAIT_LIFECYCLE_PID" 2>/dev/null || :
         wait "$WAIT_LIFECYCLE_PID" 2>/dev/null || :
     fi
+    for pid_file in "$TMP_DIR"/*.sleep.pid; do
+        if [ -f "$pid_file" ]; then
+            sleep_pid=$(<"$pid_file")
+            kill -KILL "$sleep_pid" 2>/dev/null || :
+            wait "$sleep_pid" 2>/dev/null || :
+        fi
+    done
     rm -rf -- "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -70,10 +78,7 @@ printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "${FAKE_SLEEP_HOLD:-false}" = true ] && [ "${1:-}" != "0.01" ]; then' \
     '    printf "%s\\n" "$$" >"${SLEEP_PID_FILE:?}"' \
-    '    trap ":" TERM INT' \
-    '    while [ ! -e "${RELEASE_SLEEP_FILE:?}" ]; do' \
-    '        /bin/sleep 0.05' \
-    '    done' \
+    '    exec /bin/sleep 60' \
     'fi' \
     'printf "%s\\n" "$*" >>"${SLEEP_LOG:?}"' >"$FAKE_BIN/sleep"
 chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
@@ -147,19 +152,17 @@ chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
 run_wait_lifecycle_case() {
     local label=$1 wait_command=$2
     local pid_file="$TMP_DIR/$label.sleep.pid"
-    local release_file="$TMP_DIR/$label.release"
     local trap_file="$TMP_DIR/$label.trap"
     local output_file="$TMP_DIR/$label.out"
     local error_file="$TMP_DIR/$label.err"
     local sleep_pid lifecycle_live lifecycle_rc sleep_live
 
-    rm -f -- "$pid_file" "$release_file" "$trap_file"
+    rm -f -- "$pid_file" "$trap_file"
     SLEEP_PID_FILE="$pid_file"
-    RELEASE_SLEEP_FILE="$release_file"
     TRAP_FILE="$trap_file"
     FAKE_SLEEP_HOLD=true
     PATH="$FAKE_BIN:$PATH"
-    export PATH SHUF_LOG SLEEP_LOG SLEEP_PID_FILE RELEASE_SLEEP_FILE TRAP_FILE FAKE_SLEEP_HOLD
+    export PATH SHUF_LOG SLEEP_LOG SLEEP_PID_FILE TRAP_FILE FAKE_SLEEP_HOLD
     (
         . "$SCRIPT"
         . "$ROOT/network-runtime.sh"
