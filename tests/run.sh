@@ -85,7 +85,7 @@ portability_contract() {
 
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
-    local shell_step image_step url_step only_down_step empty_proxy_step initial_step sigterm_step
+    local metadata_step metadata_input shell_step image_step url_step only_down_step empty_proxy_step initial_step sigterm_step
     local shell_input image_input url_input only_down_input empty_proxy_input initial_input sigterm_input
     require_file "$file" || return 1
 
@@ -107,6 +107,12 @@ workflow_contract() {
     require_line "$file" 'needs: build-and-smoke' 'publish dependency' || return 1
     require_line "$file" 'docker/build-push-action' 'publish build action' || return 1
     require_no_line "$file" 'arm64' 'workflow architecture scope' || return 1
+
+    metadata_step=$(extract_step "$file" publish 'Extract Docker metadata')
+    metadata_input=$(printf '%s\n' "$metadata_step")
+    require_line "$metadata_input" 'flavor: |' 'metadata latest flavor block' || return 1
+    require_line "$metadata_input" 'latest=false' 'metadata implicit latest disabled' || return 1
+    require_line "$metadata_input" 'type=raw,value=latest,enable=${{ github.ref == '\''refs/heads/main'\'' }}' 'metadata main-only latest tag rule' || return 1
 
     shell_step=$(extract_step "$file" test 'Shell syntax checks')
     require_line <(printf '%s\n' "$shell_step") \

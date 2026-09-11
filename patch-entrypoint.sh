@@ -107,8 +107,14 @@ $0 == old_proxy_default {
 }
 $0 == old_proxy_config {
     print "if [[ -n ${PROXY_CONFIG:-} ]]; then"
-    print "    printf \"strict_chain\\nquiet_mode\\nproxy_dns\\nremote_dns_subnet 224\\ntcp_read_time_out 15000\\ntcp_connect_time_out 8000\\n\\n[ProxyList]\\n%s\\n\" \"$PROXY_CONFIG\" > /etc/proxychains4.conf"
-    print "    chmod 0600 -- /etc/proxychains4.conf"
+    print "    if ! ("
+    print "        umask 077 &&"
+    print "        printf \"strict_chain\\nquiet_mode\\nproxy_dns\\nremote_dns_subnet 224\\ntcp_read_time_out 15000\\ntcp_connect_time_out 8000\\n\\n[ProxyList]\\n%s\\n\" \"$PROXY_CONFIG\" > /etc/proxychains4.conf &&"
+    print "            chmod 0600 -- /etc/proxychains4.conf"
+    print "    ); then"
+    print "        printf " sprintf("%c", 39) "%s\\n" sprintf("%c", 39) " " sprintf("%c", 39) "Error: failed to write proxy configuration." sprintf("%c", 39) " >&2"
+    print "        exit 1"
+    print "    fi"
     print "fi"
     proxy_config_count++
     next

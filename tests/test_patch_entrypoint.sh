@@ -195,13 +195,30 @@ assert_translated_messages() {
 }
 
 assert_generated_runtime_anchors() {
-    local file=$1 label=$2
+    local file=$1 label=$2 config_guard_line direct_function_line proxy_function_line download_function_line
     assert_line_exactly_once "$file" '. /usr/local/bin/random-wait.sh' "$label random helper source count" || return 1
     assert_line_exactly_once "$file" '. /usr/local/bin/network-runtime.sh' "$label network helper source count" || return 1
     assert_line_exactly_once "$file" 'if ! validate_wait_config; then' "$label wait preflight count" || return 1
     assert_line_exactly_once "$file" 'if ! validate_network_runtime_config; then' "$label network preflight count" || return 1
     assert_line_exactly_once "$file" 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$label config conditional count" || return 1
-    assert_line_exactly_once "$file" '    chmod 0600 -- /etc/proxychains4.conf' "$label config mode count" || return 1
+    assert_line_exactly_once "$file" '    if ! (' "$label config write failure guard" || return 1
+    assert_line_exactly_once "$file" '        umask 077 &&' "$label private config umask" || return 1
+    assert_line_exactly_once "$file" '        printf "strict_chain\nquiet_mode\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n[ProxyList]\n%s\n" "$PROXY_CONFIG" > /etc/proxychains4.conf &&' "$label literal config write guard" || return 1
+    assert_line_exactly_once "$file" '            chmod 0600 -- /etc/proxychains4.conf' "$label config mode count" || return 1
+    assert_line_exactly_once "$file" '    ); then' "$label config failure branch" || return 1
+    assert_line_exactly_once "$file" "        printf '%s\\n' 'Error: failed to write proxy configuration.' >&2" "$label config failure diagnostic" || return 1
+    config_guard_line=$(grep -nF -- 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$file" | cut -d: -f1)
+    direct_function_line=$(grep -nF -- 'run_speedtest_direct() {' "$file" | cut -d: -f1)
+    proxy_function_line=$(grep -nF -- 'run_speedtest_proxy() {' "$file" | cut -d: -f1)
+    download_function_line=$(grep -nF -- 'run_ddl() {' "$file" | cut -d: -f1)
+    if [ -z "$config_guard_line" ] || [ -z "$direct_function_line" ] ||
+        [ -z "$proxy_function_line" ] || [ -z "$download_function_line" ] ||
+        [ "$config_guard_line" -ge "$direct_function_line" ] ||
+        [ "$config_guard_line" -ge "$proxy_function_line" ] ||
+        [ "$config_guard_line" -ge "$download_function_line" ]; then
+        fail "$label proxy config failure gate is not before speedtest/download code"
+        return 1
+    fi
     assert_line_exactly_once "$file" 'wait_for_initial_start' "$label initial wait helper count" || return 1
     assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label signal trap count" || return 1
     assert_line_exactly_once "$file" "$NEW_DIRECT_COMMAND" "$label direct helper command count" || return 1
