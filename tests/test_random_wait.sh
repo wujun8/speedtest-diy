@@ -43,7 +43,14 @@ fi
 }
 
 TMP_DIR=$(mktemp -d)
-trap 'rm -rf -- "$TMP_DIR"' EXIT
+cleanup() {
+    if [ -n "${WAIT_LIFECYCLE_PID:-}" ]; then
+        kill -KILL "$WAIT_LIFECYCLE_PID" 2>/dev/null || :
+        wait "$WAIT_LIFECYCLE_PID" 2>/dev/null || :
+    fi
+    rm -rf -- "$TMP_DIR"
+}
+trap cleanup EXIT
 FAKE_BIN=$TMP_DIR/bin
 mkdir -p -- "$FAKE_BIN"
 SHUF_LOG=$TMP_DIR/shuf.log
@@ -61,6 +68,13 @@ printf '%s\n' \
     'esac' >"$FAKE_BIN/shuf"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
+    'if [ "${FAKE_SLEEP_HOLD:-false}" = true ] && [ "${1:-}" != "0.01" ]; then' \
+    '    printf "%s\\n" "$$" >"${SLEEP_PID_FILE:?}"' \
+    '    trap ":" TERM INT' \
+    '    while [ ! -e "${RELEASE_SLEEP_FILE:?}" ]; do' \
+    '        /bin/sleep 0.05' \
+    '    done' \
+    'fi' \
     'printf "%s\\n" "$*" >>"${SLEEP_LOG:?}"' >"$FAKE_BIN/sleep"
 chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
 
@@ -128,6 +142,73 @@ chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
     assert_eq 8 "$sampled" "empty legacy sample"
     assert_eq '-i 8-9 -n 1' "$(<"$SHUF_LOG")" "empty legacy shuf range"
 ) || exit 1
+
+# An entrypoint-owned TERM must interrupt both the initial and recurring waits.
+run_wait_lifecycle_case() {
+    local label=$1 wait_command=$2
+    local pid_file="$TMP_DIR/$label.sleep.pid"
+    local release_file="$TMP_DIR/$label.release"
+    local trap_file="$TMP_DIR/$label.trap"
+    local output_file="$TMP_DIR/$label.out"
+    local error_file="$TMP_DIR/$label.err"
+    local sleep_pid lifecycle_live lifecycle_rc sleep_live
+
+    rm -f -- "$pid_file" "$release_file" "$trap_file"
+    SLEEP_PID_FILE="$pid_file"
+    RELEASE_SLEEP_FILE="$release_file"
+    TRAP_FILE="$trap_file"
+    FAKE_SLEEP_HOLD=true
+    PATH="$FAKE_BIN:$PATH"
+    export PATH SHUF_LOG SLEEP_LOG SLEEP_PID_FILE RELEASE_SLEEP_FILE TRAP_FILE FAKE_SLEEP_HOLD
+    (
+        . "$SCRIPT"
+        . "$ROOT/network-runtime.sh"
+        trap 'cancel_network_runtime; printf "%s\n" done >"$TRAP_FILE"; exit 143' TERM INT
+        "$wait_command"
+    ) >"$output_file" 2>"$error_file" &
+    WAIT_LIFECYCLE_PID=$!
+
+    sleep_pid=''
+    for attempt in $(seq 1 300); do
+        if [ -f "$pid_file" ]; then
+            sleep_pid=$(<"$pid_file")
+            break
+        fi
+        /bin/sleep 0.01
+    done
+    if [ -z "$sleep_pid" ]; then
+        fail "$label wait did not start the held sleep"
+        return 1
+    fi
+    kill -TERM "$WAIT_LIFECYCLE_PID"
+    lifecycle_live=1
+    for attempt in $(seq 1 300); do
+        if [ ! -e "/proc/$WAIT_LIFECYCLE_PID/stat" ] ||
+            [ "$(awk '{ print $3 }' "/proc/$WAIT_LIFECYCLE_PID/stat" 2>/dev/null)" = Z ]; then
+            lifecycle_live=0
+            break
+        fi
+        /bin/sleep 0.01
+    done
+    if [ "$lifecycle_live" -ne 0 ]; then
+        fail "$label wait did not exit after TERM"
+        return 1
+    fi
+    lifecycle_rc=0
+    wait "$WAIT_LIFECYCLE_PID" || lifecycle_rc=$?
+    assert_eq 143 "$lifecycle_rc" "$label TERM exit status" || return 1
+    assert_eq 1 "$(wc -l <"$trap_file")" "$label TERM trap completion" || return 1
+    sleep_live=0
+    if [ -e "/proc/$sleep_pid/stat" ] &&
+        [ "$(awk '{ print $3 }' "/proc/$sleep_pid/stat" 2>/dev/null)" != Z ]; then
+        sleep_live=1
+    fi
+    assert_eq 0 "$sleep_live" "$label held sleep still exists" || return 1
+    WAIT_LIFECYCLE_PID=''
+}
+
+run_wait_lifecycle_case initial wait_for_initial_start || exit 1
+run_wait_lifecycle_case loop wait_for_next_run || exit 1
 
 validate_default() {
     env -i PATH="$PATH" bash -c 'set -u; . "$1"; unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX; validate_wait_config' _ "$SCRIPT"

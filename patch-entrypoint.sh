@@ -52,6 +52,9 @@ OLD_EMPTY_URL_LINE='        echo -e "\n${YELLOW}${BOLD}La variable URL_DDL est v
 OLD_DIRECT_COMMAND='        if ! cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 OLD_PROXY_COMMAND='        if ! proxychains4 cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 OLD_URL_COMMAND='        proxychains4 wget -O /dev/null --progress=dot:giga --no-check-certificate "$URL_DDL" 2>&1 | awk '\''/saved/ {print $0}'\'''
+OLD_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=true}"'
+OLD_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=true}"'
+OLD_INITIAL_SLEEP='sleep 5'
 OLD_INITIAL='echo -e "${CYAN}${BOLD}Démarrage dans 5 secondes...${RESET}"'
 
 AWK_OLD_SIGNAL_LINE=${OLD_SIGNAL_LINE//\\/\\\\}
@@ -84,6 +87,9 @@ if ! awk \
     -v old_direct_command="$OLD_DIRECT_COMMAND" \
     -v old_proxy_command="$OLD_PROXY_COMMAND" \
     -v old_url_command="$OLD_URL_COMMAND" \
+    -v old_direct_toggle_default="$OLD_DIRECT_TOGGLE_DEFAULT" \
+    -v old_proxy_toggle_default="$OLD_PROXY_TOGGLE_DEFAULT" \
+    -v old_initial_sleep="$OLD_INITIAL_SLEEP" \
     -v old_initial="$OLD_INITIAL" \
     -v new_direct_error="$NEW_DIRECT_ERROR" \
     -v new_direct_disabled="$NEW_DIRECT_DISABLED" \
@@ -208,6 +214,21 @@ $0 == old_url_command {
     url_command_count++
     next
 }
+$0 == old_direct_toggle_default {
+    print ": \"${RUN_SPEEDTEST_DIRECT:=false}\""
+    direct_toggle_default_count++
+    next
+}
+$0 == old_proxy_toggle_default {
+    print ": \"${RUN_SPEEDTEST_PROXY:=false}\""
+    proxy_toggle_default_count++
+    next
+}
+$0 == old_initial_sleep {
+    print "wait_for_initial_start"
+    initial_sleep_count++
+    next
+}
 $0 == old_initial {
     print "echo -e \"${CYAN}${BOLD}Starting in 5 seconds...${RESET}\""
     initial_count++
@@ -224,7 +245,9 @@ END {
         proxy_error_count != 1 || proxy_disabled_count != 1 ||
         download_start_count != 1 || empty_url_count != 1 ||
         direct_command_count != 1 || proxy_command_count != 1 ||
-        url_command_count != 1 || initial_count != 1) {
+        url_command_count != 1 || direct_toggle_default_count != 1 ||
+        proxy_toggle_default_count != 1 || initial_sleep_count != 1 ||
+        initial_count != 1) {
         exit 17
     }
 }

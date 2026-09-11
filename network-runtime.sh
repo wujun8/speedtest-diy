@@ -67,6 +67,21 @@ _nr_wait_for_pid_exit() {
   return 1
 }
 
+_nr_run_tracked() {
+  local pid rc
+
+  "$@" &
+  pid=$!
+  _NR_ACTIVE_PIDS+=("$pid")
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  _nr_forget_pid "$pid"
+  return "$rc"
+}
+
 cancel_network_runtime() {
   local pid
   local attempt
@@ -186,6 +201,7 @@ _nr_start_curl() {
     --output /dev/null
     --dump-header "$header_file"
     --write-out '%{http_code}\t%{size_download}\n'
+    --
     "$url"
   )
 
@@ -506,9 +522,9 @@ run_cf_speedtest_direct() {
     return 2
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
-    cf_speedtest --download-only "$@"
+    _nr_run_tracked cf_speedtest --download-only "$@"
   else
-    cf_speedtest "$@"
+    _nr_run_tracked cf_speedtest "$@"
   fi
 }
 
@@ -521,9 +537,9 @@ run_cf_speedtest_proxy() {
     return 0
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
-    proxychains4 cf_speedtest --download-only "$@"
+    _nr_run_tracked proxychains4 cf_speedtest --download-only "$@"
   else
-    proxychains4 cf_speedtest "$@"
+    _nr_run_tracked proxychains4 cf_speedtest "$@"
   fi
 }
 

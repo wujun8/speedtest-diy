@@ -93,12 +93,33 @@ sample_wait_seconds() {
     printf '%s\n' "$RANDOM_WAIT_NORMALIZED"
 }
 
+_random_wait_sleep() {
+    local seconds=$1 rc
+
+    if declare -F _nr_run_tracked >/dev/null 2>&1; then
+        _nr_run_tracked sleep "$seconds"
+        rc=$?
+        return "$rc"
+    fi
+
+    sleep "$seconds" &
+    sleep_pid=$!
+    if wait "$sleep_pid"; then
+        return 0
+    else
+        rc=$?
+        return "$rc"
+    fi
+}
+
+wait_for_initial_start() {
+    _random_wait_sleep 5
+}
+
 wait_for_next_run() {
     local seconds
 
     seconds=$(sample_wait_seconds) || return 1
     printf 'Waiting %s seconds before running the tests again...\n' "$seconds"
-    sleep "$seconds" &
-    sleep_pid=$!
-    wait "$sleep_pid"
+    _random_wait_sleep "$seconds"
 }

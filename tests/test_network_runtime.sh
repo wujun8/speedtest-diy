@@ -43,7 +43,15 @@ write_out=''
 previous=''
 silent=false
 show_error=false
+url_after_boundary=false
+url=''
 for arg in "$@"; do
+  if [[ "$url_after_boundary" == true ]]; then
+    url=$arg
+    url_after_boundary=false
+    previous=''
+    continue
+  fi
   if [[ "$previous" == '--output' || "$previous" == '-o' ]]; then
     output=$arg
   elif [[ "$previous" == '--range' || "$previous" == '-r' ]]; then
@@ -54,6 +62,7 @@ for arg in "$@"; do
     write_out=$arg
   fi
   case "$arg" in
+    --) url_after_boundary=true; previous='' ;;
     --silent|-s) silent=true; previous='' ;;
     --show-error|-S) show_error=true; previous='' ;;
     --output|-o) previous="$arg" ;;
@@ -93,6 +102,10 @@ fi
 if [[ "$silent" != true || "$show_error" != true ]]; then
   printf 'fake curl requires --silent and --show-error\n' >&2
   exit 92
+fi
+if [[ "${FAKE_REQUIRE_URL_BOUNDARY:-false}" == 'true' && -z "$url" ]]; then
+  printf 'fake curl requires an explicit -- before the URL\n' >&2
+  exit 93
 fi
 
 total=${FAKE_TOTAL:-101}
@@ -217,6 +230,13 @@ printf 'pid=%s via=%s args=%s\n' "$$" "${FAKE_VIA_PROXY:-0}" "$*" >> "$FAKE_STAT
 if [[ "${FAKE_CF_FAIL:-false}" == 'true' ]]; then
   exit 19
 fi
+if [[ "${FAKE_CF_HOLD:-false}" == 'true' ]]; then
+  printf '%s\n' "$$" > "$FAKE_STATE/cf-pid"
+  trap ':' TERM INT
+  while [[ ! -e "$FAKE_STATE/release-cf" ]]; do
+    sleep 0.05
+  done
+fi
 exit 0
 FAKE_CF
 chmod +x "$FAKE_BIN/cf_speedtest"
@@ -265,8 +285,10 @@ reset_fake_state() {
   : > "$STATE/proxy.calls"
   : > "$STATE/cf.calls"
   rm -f "$STATE"/started.* "$STATE"/worker-pid.* "$STATE"/barrier.calls "$STATE"/release-workers "$STATE"/trap-complete
+  rm -f "$STATE"/cf-pid "$STATE"/release-cf "$STATE"/cf-trap-complete
   unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS
-  unset FAKE_BAD_RANGE FAKE_FAIL_RANGE FAKE_CF_FAIL FAKE_VIA_PROXY PROXYCHAINS_CONF_FILE
+  unset FAKE_BAD_RANGE FAKE_FAIL_RANGE FAKE_CF_FAIL FAKE_CF_HOLD FAKE_REQUIRE_URL_BOUNDARY
+  unset FAKE_VIA_PROXY PROXYCHAINS_CONF_FILE
 }
 
 run_capture() {
@@ -443,6 +465,17 @@ assert_all_curl_outputs_are_dev_null
 assert_all_curl_calls_have_metadata
 pass 'single-thread download is one complete /dev/null request'
 
+# Every curl request must end its option list before an arbitrary URL argument.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_REQUIRE_URL_BOUNDARY=true
+DOWNLOAD_THREADS=1
+unset PROXY_CONFIG
+run_capture "$STATE/url-boundary.out" "$STATE/url-boundary.err" run_url_download '--url-that-starts-with-a-dash'
+assert_eq '0' "$CALL_RC" 'URL option boundary download failed'
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'URL option boundary issued the wrong number of curl calls'
+assert_contains "$(<"$STATE/url-boundary.out")" 'total bytes=101' 'URL option boundary omitted the complete-download summary'
+pass 'curl terminates options before the URL argument'
+
 # Range unsupported, malformed probe, and total <= 1 are fail-closed.
 reset_fake_state
 export FAKE_TOTAL=101 FAKE_WGET_MODE=unsupported
@@ -580,6 +613,53 @@ done
 [[ ! -e "$runtime_dir" ]] || fail 'TERM cleanup left the runtime metadata directory'
 assert_no_runtime_temp_dirs
 pass 'caller TERM cleanup terminates, reaps, and removes all segment resources'
+
+# TERM cleanup must also terminate and reap an in-flight direct cf_speedtest.
+reset_fake_state
+export FAKE_CF_HOLD=true PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+(
+  source "$RUNTIME"
+  trap 'cancel_network_runtime; printf "cf-trap-complete\n" > "$FAKE_STATE/cf-trap-complete"; exit 143' TERM INT
+  run_cf_speedtest_direct --alpha beta
+) >"$STATE/cf-lifecycle.out" 2>"$STATE/cf-lifecycle.err" &
+LIFECYCLE_PID=$!
+
+cf_pid=''
+for attempt in $(seq 1 300); do
+  if [[ -f "$STATE/cf-pid" ]]; then
+    cf_pid=$(<"$STATE/cf-pid")
+    break
+  fi
+  sleep 0.01
+done
+[[ -n "$cf_pid" ]] || fail 'cf_speedtest lifecycle test did not start the held process'
+kill -TERM "$LIFECYCLE_PID"
+lifecycle_live=1
+for attempt in $(seq 1 300); do
+  if [[ ! -e "/proc/$LIFECYCLE_PID/stat" ]] || [[ $(awk '{ print $3 }' "/proc/$LIFECYCLE_PID/stat" 2>/dev/null) == Z ]]; then
+    lifecycle_live=0
+    break
+  fi
+  sleep 0.01
+done
+if (( lifecycle_live != 0 )); then
+  kill -KILL "$LIFECYCLE_PID" 2>/dev/null || :
+  wait "$LIFECYCLE_PID" 2>/dev/null || :
+  fail 'cf_speedtest TERM cleanup did not exit within the bound'
+fi
+lifecycle_rc=0
+wait "$LIFECYCLE_PID" || lifecycle_rc=$?
+assert_eq '143' "$lifecycle_rc" 'cf_speedtest TERM trap did not complete'
+assert_eq '1' "$(count_lines "$STATE/cf-trap-complete")" 'cf_speedtest TERM trap did not return from cleanup'
+cf_live=0
+if [[ -e "/proc/$cf_pid/stat" ]] && [[ $(awk '{ print $3 }' "/proc/$cf_pid/stat" 2>/dev/null) != Z ]]; then
+  cf_live=1
+fi
+assert_eq '0' "$cf_live" 'in-flight cf_speedtest still exists after TERM cleanup'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'explicit direct cf_speedtest used proxychains4'
+assert_contains "$(<"$STATE/cf.calls")" 'via=0' 'explicit direct cf_speedtest was not direct'
+pass 'TERM cleanup terminates and reaps in-flight direct cf_speedtest'
 
 # Empty URL skips without any command invocation.
 reset_fake_state

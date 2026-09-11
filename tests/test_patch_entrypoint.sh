@@ -51,6 +51,8 @@ cat >"$SYNTHETIC_FIXTURE" <<'EOF'
 : "${DOWNLOAD_THREADS:=4}"
 : "${UPLOAD_THREADS:=4}"
 : "${SPEEDTEST_DOWNLOAD_ONLY:=false}"
+: "${RUN_SPEEDTEST_DIRECT:=true}"
+: "${RUN_SPEEDTEST_PROXY:=true}"
 : "${URL_DDL:=}"
 
 # Gestion des signaux d'arrêt
@@ -123,6 +125,8 @@ OLD_URL_DDL='        proxychains4 wget -O /dev/null --progress=dot:giga --no-che
 OLD_DIRECT_COMMAND="$OLD_DIRECT_SPEEDTEST"
 OLD_PROXY_COMMAND="$OLD_PROXY_SPEEDTEST"
 OLD_URL_COMMAND="$OLD_URL_DDL"
+OLD_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=true}"'
+OLD_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=true}"'
 OLD_WAIT_MESSAGE='    echo -e "${CYAN}${BOLD}Attente de $((WAIT_TIME / 3600)) heures avant de relancer les tests...${RESET}"'
 OLD_WAIT_SLEEP='    sleep "$WAIT_TIME" &'
 OLD_WAIT_WAIT='    wait -n'
@@ -156,6 +160,8 @@ NEW_EMPTY_URL='        echo -e "${YELLOW}${BOLD}URL_DDL is empty. Download skipp
 NEW_DIRECT_COMMAND='        if ! run_cf_speedtest_direct --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 NEW_PROXY_COMMAND='        if ! run_cf_speedtest_proxy --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 NEW_URL_COMMAND='        if ! run_url_download "$URL_DDL"; then'
+NEW_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=false}"'
+NEW_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=false}"'
 NEW_INITIAL='echo -e "${CYAN}${BOLD}Starting in 5 seconds...${RESET}"'
 
 assert_translated_messages() {
@@ -196,6 +202,7 @@ assert_generated_runtime_anchors() {
     assert_line_exactly_once "$file" 'if ! validate_network_runtime_config; then' "$label network preflight count" || return 1
     assert_line_exactly_once "$file" 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$label config conditional count" || return 1
     assert_line_exactly_once "$file" '    chmod 0600 -- /etc/proxychains4.conf' "$label config mode count" || return 1
+    assert_line_exactly_once "$file" 'wait_for_initial_start' "$label initial wait helper count" || return 1
     assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label signal trap count" || return 1
     assert_line_exactly_once "$file" "$NEW_DIRECT_COMMAND" "$label direct helper command count" || return 1
     assert_line_exactly_once "$file" "$NEW_PROXY_COMMAND" "$label proxy helper command count" || return 1
@@ -281,6 +288,8 @@ assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_COLORS_LINE" 'synthetic colo
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_INITIAL_SLEEP" 'synthetic initial delay' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_DIRECT_SPEEDTEST" 'synthetic direct speedtest' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_SPEEDTEST" 'synthetic proxy speedtest' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" 'synthetic direct toggle default' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_TOGGLE_DEFAULT" 'synthetic proxy toggle default' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_URL_DDL" 'synthetic URL_DDL download' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_MESSAGE" 'synthetic wait message' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_SLEEP" 'synthetic wait sleep' || exit 1
@@ -317,6 +326,10 @@ assert_contains_file "$TARGET" 'if ! validate_wait_config; then' 'preflight vali
 assert_contains_file "$TARGET" 'if ! validate_network_runtime_config; then' 'network preflight validation' || exit 1
 assert_contains_file "$TARGET" ': "${WAIT_TIME:=}"' 'legacy default removal' || exit 1
 assert_line_exactly_once "$TARGET" ': "${PROXY_CONFIG:=}"' 'empty proxy default' || exit 1
+assert_line_exactly_once "$TARGET" "$NEW_DIRECT_TOGGLE_DEFAULT" 'direct speedtest disabled default' || exit 1
+assert_line_exactly_once "$TARGET" "$NEW_PROXY_TOGGLE_DEFAULT" 'proxy speedtest disabled default' || exit 1
+assert_not_contains_file "$TARGET" "$OLD_DIRECT_TOGGLE_DEFAULT" 'upstream direct speedtest default removal' || exit 1
+assert_not_contains_file "$TARGET" "$OLD_PROXY_TOGGLE_DEFAULT" 'upstream proxy speedtest default removal' || exit 1
 assert_not_contains_file "$TARGET" ': "${PROXY_CONFIG:=socks5 127.0.0.1 9100}"' 'localhost proxy default removal' || exit 1
 assert_contains_file "$TARGET" 'if [[ -n ${PROXY_CONFIG:-} ]]; then' 'conditional proxy config writer' || exit 1
 assert_contains_file "$TARGET" 'chmod 0600 -- /etc/proxychains4.conf' 'private proxy config mode' || exit 1
@@ -326,7 +339,7 @@ if grep -Fq -- ': "${WAIT_TIME:=21600}"' "$TARGET"; then
     fail "upstream fixed WAIT_TIME default remains"
     exit 1
 fi
-assert_contains_file "$TARGET" 'sleep 5' 'fixed initial delay' || exit 1
+assert_contains_file "$TARGET" 'wait_for_initial_start' 'interruptible initial delay' || exit 1
 assert_contains_file "$TARGET" 'wait_for_next_run' 'random wait seam' || exit 1
 if grep -Fq -- 'sleep "$WAIT_TIME"' "$TARGET" || grep -Fq -- 'wait -n' "$TARGET"; then
     fail "old fixed wait loop remains"
@@ -366,16 +379,19 @@ DOWNLOAD_COMMENT_FIXTURE=$TMP_DIR/download-comment.sh
 EMPTY_COMMENT_FIXTURE=$TMP_DIR/empty-comment.sh
 PROXY_DEFAULT_COMMENT_FIXTURE=$TMP_DIR/proxy-default-comment.sh
 DIRECT_COMMAND_COMMENT_FIXTURE=$TMP_DIR/direct-command-comment.sh
+DIRECT_TOGGLE_COMMENT_FIXTURE=$TMP_DIR/direct-toggle-comment.sh
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_COMMENT_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_COMMENT_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_COMMENT_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$PROXY_DEFAULT_COMMENT_FIXTURE" "$OLD_PROXY_DEFAULT" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_COMMAND_COMMENT_FIXTURE" "$OLD_DIRECT_COMMAND" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_TOGGLE_COMMENT_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" || exit 1
 assert_replacement_count_rejection 'signal-comment' "$SIGNAL_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'download-comment' "$DOWNLOAD_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'empty-comment' "$EMPTY_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'proxy-default-comment' "$PROXY_DEFAULT_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'direct-command-comment' "$DIRECT_COMMAND_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-toggle-comment' "$DIRECT_TOGGLE_COMMENT_FIXTURE" || exit 1
 
 # Removing each complete old shell line must fail closed without writing.
 SIGNAL_MISSING_FIXTURE=$TMP_DIR/signal-missing.sh
@@ -383,16 +399,19 @@ DOWNLOAD_MISSING_FIXTURE=$TMP_DIR/download-missing.sh
 EMPTY_MISSING_FIXTURE=$TMP_DIR/empty-missing.sh
 PROXY_DEFAULT_MISSING_FIXTURE=$TMP_DIR/proxy-default-missing.sh
 DIRECT_COMMAND_MISSING_FIXTURE=$TMP_DIR/direct-command-missing.sh
+DIRECT_TOGGLE_MISSING_FIXTURE=$TMP_DIR/direct-toggle-missing.sh
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_MISSING_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_MISSING_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_MISSING_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$PROXY_DEFAULT_MISSING_FIXTURE" "$OLD_PROXY_DEFAULT" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_COMMAND_MISSING_FIXTURE" "$OLD_DIRECT_COMMAND" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_TOGGLE_MISSING_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" || exit 1
 assert_replacement_count_rejection 'signal-missing' "$SIGNAL_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'download-missing' "$DOWNLOAD_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'empty-missing' "$EMPTY_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'proxy-default-missing' "$PROXY_DEFAULT_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'direct-command-missing' "$DIRECT_COMMAND_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-toggle-missing' "$DIRECT_TOGGLE_MISSING_FIXTURE" || exit 1
 
 # Duplicating a new exact anchor must also fail closed without writing.
 PROXY_CONFIG_DUPLICATE_FIXTURE=$TMP_DIR/proxy-config-duplicate.sh
