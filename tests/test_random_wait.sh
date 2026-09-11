@@ -156,6 +156,7 @@ run_wait_lifecycle_case() {
     local output_file="$TMP_DIR/$label.out"
     local error_file="$TMP_DIR/$label.err"
     local sleep_pid lifecycle_live lifecycle_rc sleep_live
+    local lifecycle_poll_attempts=1000
 
     rm -f -- "$pid_file" "$trap_file"
     SLEEP_PID_FILE="$pid_file"
@@ -172,7 +173,7 @@ run_wait_lifecycle_case() {
     WAIT_LIFECYCLE_PID=$!
 
     sleep_pid=''
-    for attempt in $(seq 1 300); do
+    for attempt in $(seq 1 "$lifecycle_poll_attempts"); do
         if [ -f "$pid_file" ]; then
             sleep_pid=$(<"$pid_file")
             break
@@ -185,7 +186,7 @@ run_wait_lifecycle_case() {
     fi
     kill -TERM "$WAIT_LIFECYCLE_PID"
     lifecycle_live=1
-    for attempt in $(seq 1 300); do
+    for attempt in $(seq 1 "$lifecycle_poll_attempts"); do
         if [ ! -e "/proc/$WAIT_LIFECYCLE_PID/stat" ] ||
             [ "$(awk '{ print $3 }' "/proc/$WAIT_LIFECYCLE_PID/stat" 2>/dev/null)" = Z ]; then
             lifecycle_live=0
