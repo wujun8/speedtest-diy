@@ -191,9 +191,21 @@ _nr_start_curl() {
   local url=$3
   local range=${4-}
   local -a curl_args
+  local -a clear_proxy_env
   local pid
 
-  curl_args=(--fail --location --silent --show-error)
+  clear_proxy_env=(
+    env
+    -u HTTP_PROXY
+    -u HTTPS_PROXY
+    -u ALL_PROXY
+    -u NO_PROXY
+    -u http_proxy
+    -u https_proxy
+    -u all_proxy
+    -u no_proxy
+  )
+  curl_args=(--disable --noproxy '*' --fail --location --silent --show-error)
   if [[ -n $range ]]; then
     curl_args+=(--range "$range")
   fi
@@ -206,9 +218,9 @@ _nr_start_curl() {
   )
 
   if [[ -n ${PROXY_CONFIG:-} ]]; then
-    proxychains4 curl "${curl_args[@]}" >"$metadata_file" &
+    "${clear_proxy_env[@]}" proxychains4 curl "${curl_args[@]}" >"$metadata_file" &
   else
-    curl "${curl_args[@]}" >"$metadata_file" &
+    "${clear_proxy_env[@]}" curl "${curl_args[@]}" >"$metadata_file" &
   fi
   pid=$!
   _NR_ACTIVE_PIDS+=("$pid")
@@ -518,17 +530,43 @@ run_url_download() {
 }
 
 run_cf_speedtest_direct() {
+  local -a clear_proxy_env
+
+  clear_proxy_env=(
+    env
+    -u HTTP_PROXY
+    -u HTTPS_PROXY
+    -u ALL_PROXY
+    -u NO_PROXY
+    -u http_proxy
+    -u https_proxy
+    -u all_proxy
+    -u no_proxy
+  )
   if ! validate_network_runtime_config; then
     return 2
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
-    _nr_run_tracked cf_speedtest --download-only "$@"
+    _nr_run_tracked "${clear_proxy_env[@]}" cf_speedtest --download-only "$@"
   else
-    _nr_run_tracked cf_speedtest "$@"
+    _nr_run_tracked "${clear_proxy_env[@]}" cf_speedtest "$@"
   fi
 }
 
 run_cf_speedtest_proxy() {
+  local -a clear_proxy_env
+
+  clear_proxy_env=(
+    env
+    -u HTTP_PROXY
+    -u HTTPS_PROXY
+    -u ALL_PROXY
+    -u NO_PROXY
+    -u http_proxy
+    -u https_proxy
+    -u all_proxy
+    -u no_proxy
+  )
   if ! validate_network_runtime_config; then
     return 2
   fi
@@ -537,9 +575,9 @@ run_cf_speedtest_proxy() {
     return 0
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
-    _nr_run_tracked proxychains4 cf_speedtest --download-only "$@"
+    _nr_run_tracked "${clear_proxy_env[@]}" proxychains4 cf_speedtest --download-only "$@"
   else
-    _nr_run_tracked proxychains4 cf_speedtest "$@"
+    _nr_run_tracked "${clear_proxy_env[@]}" proxychains4 cf_speedtest "$@"
   fi
 }
 

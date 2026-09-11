@@ -36,6 +36,33 @@ set -u
 
 : "${FAKE_STATE:?FAKE_STATE is required}"
 log="$FAKE_STATE/curl.calls"
+env_log="$FAKE_STATE/curl.env"
+options_log="$FAKE_STATE/curl.options"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+printf 'first=%s noproxy_name=%s noproxy_value=%s\n' "${1-}" "${2-}" "${3-}" >> "$options_log"
+contract_error=''
+if [[ ${1-} != '--disable' ]]; then
+  contract_error+=" first_option=${1-}"
+fi
+if [[ ${2-} != '--noproxy' || ${3-} != '*' ]]; then
+  contract_error+=" noproxy_args=${2-},${3-}"
+fi
+if (( proxy_env_present != 0 )); then
+  contract_error+=' ambient_proxy_env_present'
+fi
+if [[ -n "$contract_error" ]]; then
+  printf 'fake curl contract violation:%s\n' "$contract_error" >&2
+  exit 94
+fi
 output=''
 range=''
 header_file=''
@@ -207,6 +234,21 @@ cat > "$FAKE_BIN/proxychains4" <<'FAKE_PROXY'
 set -u
 
 : "${FAKE_STATE:?FAKE_STATE is required}"
+env_log="$FAKE_STATE/proxy.env"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+if (( proxy_env_present != 0 )); then
+  printf 'fake proxychains4 saw ambient proxy environment\n' >&2
+  exit 95
+fi
 printf 'pid=%s conf_set=%s conf_value=%s args=%s\n' \
   "$$" "${PROXYCHAINS_CONF_FILE+x}" "${PROXYCHAINS_CONF_FILE-}" "$*" >> "$FAKE_STATE/proxy.calls"
 if [[ "${1:-}" == '-f' ]]; then
@@ -226,6 +268,21 @@ cat > "$FAKE_BIN/cf_speedtest" <<'FAKE_CF'
 set -u
 
 : "${FAKE_STATE:?FAKE_STATE is required}"
+env_log="$FAKE_STATE/cf.env"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+if (( proxy_env_present != 0 )); then
+  printf 'fake cf_speedtest saw ambient proxy environment\n' >&2
+  exit 96
+fi
 printf 'pid=%s via=%s args=%s\n' "$$" "${FAKE_VIA_PROXY:-0}" "$*" >> "$FAKE_STATE/cf.calls"
 if [[ "${FAKE_CF_FAIL:-false}" == 'true' ]]; then
   exit 19
@@ -245,9 +302,13 @@ export PATH="$FAKE_BIN:$PATH"
 export FAKE_STATE="$STATE"
 export TMPDIR="$RUNTIME_TMP"
 : > "$STATE/curl.calls"
+: > "$STATE/curl.env"
+: > "$STATE/curl.options"
 : > "$STATE/wget.calls"
 : > "$STATE/proxy.calls"
+: > "$STATE/proxy.env"
 : > "$STATE/cf.calls"
+: > "$STATE/cf.env"
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -279,11 +340,64 @@ assert_not_contains() {
   [[ "$haystack" != *"$needle"* ]] || fail "$message (unexpected [$needle])"
 }
 
+set_poison_proxy_env() {
+  HTTP_PROXY='poison-HTTP_PROXY'
+  HTTPS_PROXY='poison-HTTPS_PROXY'
+  ALL_PROXY='poison-ALL_PROXY'
+  NO_PROXY='poison-NO_PROXY'
+  http_proxy='poison-http_proxy'
+  https_proxy='poison-https_proxy'
+  all_proxy='poison-all_proxy'
+  no_proxy='poison-no_proxy'
+  export HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  export http_proxy https_proxy all_proxy no_proxy
+}
+
+assert_poison_proxy_env_preserved() {
+  assert_eq 'poison-HTTP_PROXY' "$HTTP_PROXY" 'caller HTTP_PROXY changed'
+  assert_eq 'poison-HTTPS_PROXY' "$HTTPS_PROXY" 'caller HTTPS_PROXY changed'
+  assert_eq 'poison-ALL_PROXY' "$ALL_PROXY" 'caller ALL_PROXY changed'
+  assert_eq 'poison-NO_PROXY' "$NO_PROXY" 'caller NO_PROXY changed'
+  assert_eq 'poison-http_proxy' "$http_proxy" 'caller http_proxy changed'
+  assert_eq 'poison-https_proxy' "$https_proxy" 'caller https_proxy changed'
+  assert_eq 'poison-all_proxy' "$all_proxy" 'caller all_proxy changed'
+  assert_eq 'poison-no_proxy' "$no_proxy" 'caller no_proxy changed'
+}
+
+assert_child_proxy_env_absent() {
+  local log=$1
+  local expected_calls=$2
+  local key
+  local bad
+
+  assert_eq "$((expected_calls * 8))" "$(count_lines "$log")" "child proxy-environment log count was wrong: $log"
+  bad=$(awk '$1 !~ /^absent=/' "$log")
+  [[ -z "$bad" ]] || fail "child saw an ambient proxy variable in $log: $bad"
+  for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    assert_eq "$expected_calls" \
+      "$(awk -v key="$key" '$1 == ("absent=" key) { n++ } END { print n + 0 }' "$log")" \
+      "child proxy-environment log missed $key in $log"
+  done
+}
+
+assert_curl_options() {
+  local expected_calls=$1
+  local bad
+
+  assert_eq "$expected_calls" "$(count_lines "$STATE/curl.options")" 'curl option log count was wrong'
+  bad=$(awk '$1 != "first=--disable" || $2 != "noproxy_name=--noproxy" || $3 != "noproxy_value=*" { print }' "$STATE/curl.options")
+  [[ -z "$bad" ]] || fail "curl option contract was wrong: $bad"
+}
+
 reset_fake_state() {
   : > "$STATE/curl.calls"
+  : > "$STATE/curl.env"
+  : > "$STATE/curl.options"
   : > "$STATE/wget.calls"
   : > "$STATE/proxy.calls"
+  : > "$STATE/proxy.env"
   : > "$STATE/cf.calls"
+  : > "$STATE/cf.env"
   rm -f "$STATE"/started.* "$STATE"/worker-pid.* "$STATE"/barrier.calls "$STATE"/release-workers "$STATE"/trap-complete
   rm -f "$STATE"/cf-pid "$STATE"/release-cf "$STATE"/cf-trap-complete
   unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS
@@ -385,6 +499,68 @@ for invalid_mode in TRUE False 1 0 yes ''; do
   assert_eq '0' "$(count_lines "$STATE/cf.calls")" "invalid mode [$invalid_mode] invoked cf_speedtest"
 done
 pass 'invalid SPEEDTEST_DOWNLOAD_ONLY values fail before speed tests'
+
+# Ambient proxy variables must be absent from every network child, while the
+# caller keeps its original values. Fake curl also asserts the curl options.
+set_poison_proxy_env
+
+reset_fake_state
+export FAKE_TOTAL=101
+unset PROXY_CONFIG
+DOWNLOAD_THREADS=1
+run_capture "$STATE/env-direct-url.out" "$STATE/env-direct-url.err" run_url_download 'http://example.test/file'
+if (( CALL_RC != 0 )); then
+  fail "direct URL proxy isolation/options failed: $(<"$STATE/env-direct-url.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'direct URL isolation test made the wrong number of curl calls'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct URL isolation test used proxychains4'
+assert_child_proxy_env_absent "$STATE/curl.env" 1
+assert_curl_options 1
+assert_poison_proxy_env_preserved
+pass 'direct URL clears all ambient proxy variables and disables curlrc'
+
+reset_fake_state
+export FAKE_TOTAL=101
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+DOWNLOAD_THREADS=1
+run_capture "$STATE/env-proxy-url.out" "$STATE/env-proxy-url.err" run_url_download 'http://example.test/file'
+if (( CALL_RC != 0 )); then
+  fail "proxy URL proxy isolation/options failed: $(<"$STATE/env-proxy-url.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'proxy URL isolation test made the wrong number of curl calls'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy URL isolation test did not use proxychains4'
+assert_child_proxy_env_absent "$STATE/curl.env" 1
+assert_child_proxy_env_absent "$STATE/proxy.env" 1
+assert_curl_options 1
+assert_poison_proxy_env_preserved
+pass 'proxy URL clears all ambient proxy variables before proxychains4'
+
+reset_fake_state
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/env-direct-cf.out" "$STATE/env-direct-cf.err" run_cf_speedtest_direct --alpha beta
+if (( CALL_RC != 0 )); then
+  fail "direct cf_speedtest proxy isolation failed: $(<"$STATE/env-direct-cf.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'direct cf isolation test made the wrong number of calls'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct cf isolation test used proxychains4'
+assert_child_proxy_env_absent "$STATE/cf.env" 1
+assert_poison_proxy_env_preserved
+pass 'direct cf_speedtest clears all ambient proxy variables'
+
+reset_fake_state
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/env-proxy-cf.out" "$STATE/env-proxy-cf.err" run_cf_speedtest_proxy --alpha beta
+if (( CALL_RC != 0 )); then
+  fail "proxy cf_speedtest proxy isolation failed: $(<"$STATE/env-proxy-cf.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'proxy cf isolation test made the wrong number of calls'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy cf isolation test did not use proxychains4'
+assert_child_proxy_env_absent "$STATE/proxy.env" 1
+assert_child_proxy_env_absent "$STATE/cf.env" 1
+assert_poison_proxy_env_preserved
+pass 'proxy cf_speedtest clears all ambient proxy variables before proxychains4'
 
 # Direct URL download: one probe plus four concurrent, exact contiguous ranges.
 reset_fake_state
