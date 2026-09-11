@@ -130,6 +130,9 @@ OLD_EMPTY_URL_TEXT='La variable URL_DDL est vide. Téléchargement annulé.'
 OLD_INITIAL_TEXT='Démarrage dans 5 secondes...'
 
 OLD_SIGNAL="trap \"echo -e '\\e[1;31m${OLD_SIGNAL_TEXT}\\e[0m'; exit 0\" SIGTERM SIGINT"
+OLD_SIGNAL_LINE=$OLD_SIGNAL
+OLD_DOWNLOAD_START_LINE="        echo -e \"\\n\${BLUE}\${BOLD}${OLD_DOWNLOAD_START_TEXT}\${RESET}\\n\""
+OLD_EMPTY_URL_LINE="        echo -e \"\\n\${YELLOW}\${BOLD}${OLD_EMPTY_URL_TEXT}\${RESET}\\n\""
 NEW_SIGNAL="trap \"echo -e '\\e[1;31mStop requested. Cleaning up and exiting...\\e[0m'; exit 0\" SIGTERM SIGINT"
 NEW_DIRECT_START='        echo -e "${GREEN}${BOLD}Starting direct speed test... ($((TEST_DURATION * 2)) sec)${RESET}"'
 NEW_DIRECT_ERROR='            echo -e "${RED}${BOLD}Error: direct speed test failed${RESET}"'
@@ -169,6 +172,61 @@ assert_translated_messages() {
     done
 }
 
+make_comment_anchor_fixture() {
+    local source=$1 dest=$2 old=$3 line count=0
+    : >"$dest"
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$line" = "$old" ]; then
+            printf '# %s\n' "$old" >>"$dest"
+            count=$((count + 1))
+        else
+            printf '%s\n' "$line" >>"$dest"
+        fi
+    done <"$source"
+    if [ "$count" -ne 1 ]; then
+        fail "could not replace exactly one anchor in $dest (got $count)"
+        return 1
+    fi
+    chmod 755 "$dest"
+}
+
+make_missing_anchor_fixture() {
+    local source=$1 dest=$2 old=$3 line count=0
+    : >"$dest"
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$line" = "$old" ]; then
+            count=$((count + 1))
+        else
+            printf '%s\n' "$line" >>"$dest"
+        fi
+    done <"$source"
+    if [ "$count" -ne 1 ]; then
+        fail "could not remove exactly one anchor in $dest (got $count)"
+        return 1
+    fi
+    chmod 755 "$dest"
+}
+
+assert_replacement_count_rejection() {
+    local label=$1 fixture=$2 fixture_sha before_copy output
+    before_copy=$TMP_DIR/$label.before
+    cp -- "$fixture" "$before_copy"
+    fixture_sha=$(sha256sum -- "$fixture" | awk '{print $1}')
+    if output=$(EXPECTED_UPSTREAM_SHA256="$fixture_sha" /bin/bash "$ROOT/patch-entrypoint.sh" "$fixture" 2>&1); then
+        fail "$label was accepted despite its missing exact anchor"
+        return 1
+    fi
+    assert_contains_file <(printf '%s\n' "$output") \
+        'expected upstream log and WAIT_TIME seams were not found exactly once' \
+        "$label replacement-count diagnostic" || return 1
+    assert_not_contains_file <(printf '%s\n' "$output") 'SHA256 mismatch' \
+        "$label reached replacement-count gate" || return 1
+    if ! cmp -s -- "$before_copy" "$fixture"; then
+        fail "$label rejection modified its input"
+        return 1
+    fi
+}
+
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_DEFAULT" 'synthetic WAIT_TIME default' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_COLORS_LINE" 'synthetic color anchor' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_INITIAL_SLEEP" 'synthetic initial delay' || exit 1
@@ -178,15 +236,15 @@ assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_URL_DDL" 'synthetic URL_DDL 
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_MESSAGE" 'synthetic wait message' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_SLEEP" 'synthetic wait sleep' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_WAIT" 'synthetic wait wait' || exit 1
-assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_SIGNAL" 'synthetic signal log' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_SIGNAL_LINE" 'synthetic signal log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\${GREEN}\${BOLD}${OLD_DIRECT_START_TEXT} (\$((TEST_DURATION * 2)) sec)\${RESET}\"" 'synthetic direct-start log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "            echo -e \"\${RED}\${BOLD}${OLD_DIRECT_ERROR_TEXT}\${RESET}\"" 'synthetic direct-error log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\${YELLOW}\${BOLD}${OLD_DIRECT_DISABLED_TEXT}\${RESET}\"" 'synthetic direct-disabled log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\${BLUE}\${BOLD}${OLD_PROXY_START_TEXT} (\$((TEST_DURATION * 2)) sec)\${RESET}\"" 'synthetic proxy-start log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "            echo -e \"\${RED}\${BOLD}${OLD_PROXY_ERROR_TEXT}\${RESET}\"" 'synthetic proxy-error log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\${YELLOW}\${BOLD}${OLD_PROXY_DISABLED_TEXT}\${RESET}\"" 'synthetic proxy-disabled log' || exit 1
-assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\\n\${BLUE}\${BOLD}${OLD_DOWNLOAD_START_TEXT}\${RESET}\\n\"" 'synthetic download-start log' || exit 1
-assert_line_exactly_once "$SYNTHETIC_FIXTURE" "        echo -e \"\\n\${YELLOW}\${BOLD}${OLD_EMPTY_URL_TEXT}\${RESET}\\n\"" 'synthetic empty-URL log' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_DOWNLOAD_START_LINE" 'synthetic download-start log' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_EMPTY_URL_LINE" 'synthetic empty-URL log' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "echo -e \"\${CYAN}\${BOLD}${OLD_INITIAL_TEXT}\${RESET}\"" 'synthetic initial log' || exit 1
 
 SYNTHETIC_SHA=$(sha256sum -- "$SYNTHETIC_FIXTURE" | awk '{print $1}')
@@ -230,6 +288,28 @@ if grep -nE '(^|[^[:alnum:]_])eval([[:space:]]|$)' "$ROOT/patch-entrypoint.sh" "
     fail "patch or patched entrypoint contains eval"
     exit 1
 fi
+
+# Similar-looking comments must not satisfy the complete shell-line anchors.
+SIGNAL_COMMENT_FIXTURE=$TMP_DIR/signal-comment.sh
+DOWNLOAD_COMMENT_FIXTURE=$TMP_DIR/download-comment.sh
+EMPTY_COMMENT_FIXTURE=$TMP_DIR/empty-comment.sh
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_COMMENT_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_COMMENT_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_COMMENT_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
+assert_replacement_count_rejection 'signal-comment' "$SIGNAL_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'download-comment' "$DOWNLOAD_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'empty-comment' "$EMPTY_COMMENT_FIXTURE" || exit 1
+
+# Removing each complete old shell line must fail closed without writing.
+SIGNAL_MISSING_FIXTURE=$TMP_DIR/signal-missing.sh
+DOWNLOAD_MISSING_FIXTURE=$TMP_DIR/download-missing.sh
+EMPTY_MISSING_FIXTURE=$TMP_DIR/empty-missing.sh
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_MISSING_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_MISSING_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_MISSING_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
+assert_replacement_count_rejection 'signal-missing' "$SIGNAL_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'download-missing' "$DOWNLOAD_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'empty-missing' "$EMPTY_MISSING_FIXTURE" || exit 1
 
 # Reject a changed synthetic entrypoint before any write and leave it byte-for-byte intact.
 BAD=$TMP_DIR/bad-entrypoint.sh

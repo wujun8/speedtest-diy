@@ -135,6 +135,17 @@ jobs:
           done
           timeout 10s docker stop --time 5 "$container_id"
           [ "$(docker inspect -f '{{.State.Running}}' "$container_id")" = false ]
+          logs=$(docker logs "$container_id" 2>&1 || true)
+          if ! grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$logs"; then
+            printf '%s\n' 'missing English shutdown log: Stop requested. Cleaning up and exiting...' >&2
+            printf '%s\n' "$logs" >&2
+            exit 1
+          fi
+          if grep -Fq -- 'Arrêt du script demandé.' <<<"$logs"; then
+            printf '%s\n' 'unexpected French shutdown log: Arrêt du script demandé.' >&2
+            printf '%s\n' "$logs" >&2
+            exit 1
+          fi
 
   publish:
     name: Publish GHCR image

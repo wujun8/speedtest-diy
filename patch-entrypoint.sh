@@ -38,16 +38,20 @@ OLD_COLORS_LINE='# Définir les couleurs avec tput'
 OLD_WAIT_MESSAGE='    echo -e "${CYAN}${BOLD}Attente de $((WAIT_TIME / 3600)) heures avant de relancer les tests...${RESET}"'
 OLD_WAIT_SLEEP='    sleep "$WAIT_TIME" &'
 OLD_WAIT_WAIT='    wait -n'
-OLD_SIGNAL_TEXT='Arrêt du script demandé. Nettoyage et sortie...'
+OLD_SIGNAL_LINE="trap \"echo -e '\\e[1;31mArrêt du script demandé. Nettoyage et sortie...\\e[0m'; exit 0\" SIGTERM SIGINT"
 OLD_DIRECT_START='        echo -e "${GREEN}${BOLD}Lancement du test de vitesse en direct... ($((TEST_DURATION * 2)) sec)${RESET}"'
 OLD_DIRECT_ERROR='            echo -e "${RED}${BOLD}Erreur : Échec du test de vitesse en direct${RESET}"'
 OLD_DIRECT_DISABLED='        echo -e "${YELLOW}${BOLD}Test de vitesse en direct désactivé.${RESET}"'
 OLD_PROXY_START='        echo -e "${BLUE}${BOLD}Lancement du test de vitesse via proxychains4... ($((TEST_DURATION * 2)) sec)${RESET}"'
 OLD_PROXY_ERROR='            echo -e "${RED}${BOLD}Erreur : Échec du test de vitesse via proxychains${RESET}"'
 OLD_PROXY_DISABLED='        echo -e "${YELLOW}${BOLD}Test de vitesse via proxychains désactivé.${RESET}"'
-OLD_DOWNLOAD_START_TEXT='Lancement du téléchargement depuis : $URL_DDL'
-OLD_EMPTY_URL_TEXT='La variable URL_DDL est vide. Téléchargement annulé.'
+OLD_DOWNLOAD_START_LINE='        echo -e "\n${BLUE}${BOLD}Lancement du téléchargement depuis : $URL_DDL${RESET}\n"'
+OLD_EMPTY_URL_LINE='        echo -e "\n${YELLOW}${BOLD}La variable URL_DDL est vide. Téléchargement annulé.${RESET}\n"'
 OLD_INITIAL='echo -e "${CYAN}${BOLD}Démarrage dans 5 secondes...${RESET}"'
+
+AWK_OLD_SIGNAL_LINE=${OLD_SIGNAL_LINE//\\/\\\\}
+AWK_OLD_DOWNLOAD_START_LINE=${OLD_DOWNLOAD_START_LINE//\\/\\\\}
+AWK_OLD_EMPTY_URL_LINE=${OLD_EMPTY_URL_LINE//\\/\\\\}
 
 NEW_DIRECT_START='        echo -e "${GREEN}${BOLD}Starting direct speed test... ($((TEST_DURATION * 2)) sec)${RESET}"'
 NEW_DIRECT_ERROR='            echo -e "${RED}${BOLD}Error: direct speed test failed${RESET}"'
@@ -62,15 +66,15 @@ if ! awk \
     -v old_wait_message="$OLD_WAIT_MESSAGE" \
     -v old_wait_sleep="$OLD_WAIT_SLEEP" \
     -v old_wait_wait="$OLD_WAIT_WAIT" \
-    -v old_signal_text="$OLD_SIGNAL_TEXT" \
+    -v old_signal_line="$AWK_OLD_SIGNAL_LINE" \
     -v old_direct_start="$OLD_DIRECT_START" \
     -v old_direct_error="$OLD_DIRECT_ERROR" \
     -v old_direct_disabled="$OLD_DIRECT_DISABLED" \
     -v old_proxy_start="$OLD_PROXY_START" \
     -v old_proxy_error="$OLD_PROXY_ERROR" \
     -v old_proxy_disabled="$OLD_PROXY_DISABLED" \
-    -v old_download_start_text="$OLD_DOWNLOAD_START_TEXT" \
-    -v old_empty_url_text="$OLD_EMPTY_URL_TEXT" \
+    -v old_download_start_line="$AWK_OLD_DOWNLOAD_START_LINE" \
+    -v old_empty_url_line="$AWK_OLD_EMPTY_URL_LINE" \
     -v old_initial="$OLD_INITIAL" \
     -v new_direct_start="$NEW_DIRECT_START" \
     -v new_direct_error="$NEW_DIRECT_ERROR" \
@@ -107,7 +111,7 @@ $0 == old_wait_wait {
     loop_wait_count++
     next
 }
-index($0, old_signal_text) > 0 {
+$0 == old_signal_line {
     print "trap " sprintf("%c", 34) "echo -e " sprintf("%c", 39) sprintf("%c", 92) "e[1;31mStop requested. Cleaning up and exiting..." sprintf("%c", 92) "e[0m" sprintf("%c", 39) "; exit 0" sprintf("%c", 34) " SIGTERM SIGINT"
     signal_count++
     next
@@ -142,12 +146,12 @@ $0 == old_proxy_disabled {
     proxy_disabled_count++
     next
 }
-index($0, old_download_start_text) > 0 {
+$0 == old_download_start_line {
     print "        echo -e \"\\n${BLUE}${BOLD}Starting download from: $URL_DDL${RESET}\\n\""
     download_start_count++
     next
 }
-index($0, old_empty_url_text) > 0 {
+$0 == old_empty_url_line {
     print "        echo -e \"\\n${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}\\n\""
     empty_url_count++
     next

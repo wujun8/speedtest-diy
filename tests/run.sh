@@ -60,6 +60,7 @@ portability_contract() {
 
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
+    local sigterm_step post_stop_step post_stop_logs
     require_file "$file" || return 1
 
     require_line "$file" 'name: container' 'workflow name' || return 1
@@ -92,6 +93,39 @@ workflow_contract() {
     require_line "$file" 'needs: build-and-smoke' 'publish dependency' || return 1
     require_line "$file" 'docker/build-push-action' 'publish build action' || return 1
     require_no_line "$file" 'arm64' 'workflow architecture scope' || return 1
+
+    sigterm_step=$(awk '
+        /^      - name: Verify SIGTERM shutdown$/ { in_step=1 }
+        in_step && /^      - name:/ && $0 !~ /^      - name: Verify SIGTERM shutdown$/ { exit }
+        in_step && /^  [[:alnum:]_-]+:/ { exit }
+        in_step { print }
+    ' "$file")
+    if [ -z "$sigterm_step" ]; then
+        printf 'FAIL: SIGTERM smoke step is missing\n' >&2
+        return 1
+    fi
+    post_stop_step=$(awk '
+        /timeout 10s docker stop --time 5/ { after_stop=1; next }
+        after_stop { print }
+    ' <<<"$sigterm_step")
+    require_line <(printf '%s\n' "$post_stop_step") \
+        'logs=$(docker logs "$container_id" 2>&1 || true)' \
+        'post-stop Docker log reread' || return 1
+    require_line <(printf '%s\n' "$post_stop_step") \
+        "docker inspect -f '{{.State.Running}}' \"\$container_id\"" \
+        'post-stop State.Running check' || return 1
+    require_line <(printf '%s\n' "$post_stop_step") '= false ]' \
+        'post-stop stopped-state assertion' || return 1
+    post_stop_logs=$(awk '
+        /logs=\$\(docker logs/ { after_logs=1; next }
+        after_logs { print }
+    ' <<<"$post_stop_step")
+    require_line <(printf '%s\n' "$post_stop_logs") \
+        "if ! grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<\"\$logs\"; then" \
+        'post-stop English shutdown log assertion' || return 1
+    require_line <(printf '%s\n' "$post_stop_logs") \
+        "if grep -Fq -- 'Arrêt du script demandé.' <<<\"\$logs\"; then" \
+        'post-stop French shutdown log rejection' || return 1
 
     if command -v ruby >/dev/null 2>&1; then
         ruby -e 'require "yaml"; YAML.load_file(ARGV.fetch(0))' "$file" || {
