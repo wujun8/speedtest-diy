@@ -2,6 +2,104 @@
 
 # Sourceable network runtime helpers. Sourcing this file performs no network I/O.
 
+_NR_RUNTIME_DIR=
+_NR_ACTIVE_PIDS=()
+_NR_LAST_PID=
+
+_nr_create_runtime_dir() {
+  local tmpdir=${TMPDIR:-/tmp}
+  local runtime_dir
+
+  if ! runtime_dir=$(umask 077; mktemp -d "$tmpdir/network-runtime.XXXXXX"); then
+    printf 'ERROR: could not create private network runtime metadata directory.\n' >&2
+    return 1
+  fi
+  printf '%s\n' "$runtime_dir"
+}
+
+_nr_remove_runtime_dir() {
+  local runtime_dir=${1-}
+
+  if [[ -n $runtime_dir && $runtime_dir != / &&
+        ( -d $runtime_dir || -L $runtime_dir ) ]]; then
+    rm -rf -- "$runtime_dir" 2>/dev/null || :
+  fi
+}
+
+_nr_cleanup_runtime() {
+  local runtime_dir=${_NR_RUNTIME_DIR-}
+
+  _nr_remove_runtime_dir "$runtime_dir"
+  _NR_RUNTIME_DIR=
+  _NR_ACTIVE_PIDS=()
+}
+
+_nr_pid_running() {
+  local pid=${1-}
+  local proc_stat state
+
+  if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  if [[ -r /proc/$pid/stat ]]; then
+    proc_stat=$(<"/proc/$pid/stat") || return 0
+    proc_stat=${proc_stat##*) }
+    state=${proc_stat%% *}
+    [[ $state != Z ]]
+    return
+  fi
+  return 0
+}
+
+_nr_wait_for_pid_exit() {
+  local pid=${1-}
+  local attempt
+
+  [[ -n $pid ]] || return 0
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if ! _nr_pid_running "$pid"; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  return 1
+}
+
+cancel_network_runtime() {
+  local pid
+  local attempt
+  local any_running
+  local -a active_pids=("${_NR_ACTIVE_PIDS[@]}")
+
+  for pid in "${active_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || :
+  done
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    any_running=0
+    for pid in "${active_pids[@]}"; do
+      if _nr_pid_running "$pid"; then
+        any_running=1
+      fi
+    done
+    if (( any_running == 0 )); then
+      break
+    fi
+    if (( attempt < 99 )); then
+      sleep 0.01
+    fi
+  done
+  for pid in "${active_pids[@]}"; do
+    if _nr_pid_running "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || :
+    fi
+  done
+  for pid in "${active_pids[@]}"; do
+    wait "$pid" 2>/dev/null || :
+  done
+  _nr_cleanup_runtime
+  return 0
+}
+
 _nr_normalize_decimal() {
   local value=${1-}
 
@@ -12,6 +110,18 @@ _nr_normalize_decimal() {
     value=${value#0}
   done
   printf '%s\n' "$value"
+}
+
+_nr_validate_signed_max_decimal() {
+  local value=$1
+
+  if (( ${#value} > 19 )); then
+    return 1
+  fi
+  if (( ${#value} == 19 )) && [[ $value > 9223372036854775807 ]]; then
+    return 1
+  fi
+  return 0
 }
 
 validate_network_runtime_config() {
@@ -58,12 +168,13 @@ _nr_remove_files() {
   done
 }
 
-_nr_run_curl() {
+_nr_start_curl() {
   local header_file=$1
   local metadata_file=$2
   local url=$3
   local range=${4-}
   local -a curl_args
+  local pid
 
   curl_args=(--fail --location)
   if [[ -n $range ]]; then
@@ -77,10 +188,37 @@ _nr_run_curl() {
   )
 
   if [[ -n ${PROXY_CONFIG:-} ]]; then
-    PROXYCHAINS_CONF_FILE="$PROXY_CONFIG" proxychains4 curl "${curl_args[@]}" >"$metadata_file"
+    proxychains4 curl "${curl_args[@]}" >"$metadata_file" &
   else
-    curl "${curl_args[@]}" >"$metadata_file"
+    curl "${curl_args[@]}" >"$metadata_file" &
   fi
+  pid=$!
+  _NR_ACTIVE_PIDS+=("$pid")
+  _NR_LAST_PID=$pid
+}
+
+_nr_forget_pid() {
+  local target=${1-}
+  local pid
+  local -a remaining=()
+
+  for pid in "${_NR_ACTIVE_PIDS[@]}"; do
+    if [[ $pid != "$target" ]]; then
+      remaining+=("$pid")
+    fi
+  done
+  _NR_ACTIVE_PIDS=("${remaining[@]}")
+}
+
+_nr_wait_curl() {
+  local pid=${1-}
+  local rc
+
+  [[ -n $pid ]] || return 1
+  wait "$pid"
+  rc=$?
+  _nr_forget_pid "$pid"
+  return "$rc"
 }
 
 _nr_parse_curl_metadata() {
@@ -171,6 +309,10 @@ _nr_validate_probe_response() {
     printf 'ERROR: Range probe Content-Range contains an invalid decimal value.\n' >&2
     return 1
   fi
+  if ! _nr_validate_signed_max_decimal "$total"; then
+    printf 'ERROR: Range probe total exceeds the signed 64-bit maximum.\n' >&2
+    return 1
+  fi
   if [[ $raw_start != 0 || $raw_end != 0 ]]; then
     printf 'ERROR: Range probe Content-Range was not exactly bytes 0-0/TOTAL.\n' >&2
     return 1
@@ -239,24 +381,6 @@ _nr_validate_segment_response() {
   return 0
 }
 
-_nr_download_segment() {
-  local url=$1
-  local start=$2
-  local end=$3
-  local total=$4
-  local header_file=$5
-  local metadata_file=$6
-
-  if ! _nr_run_curl "$header_file" "$metadata_file" "$url" "$start-$end"; then
-    printf 'ERROR: URL segment bytes %s-%s curl command failed.\n' "$start" "$end" >&2
-    return 1
-  fi
-  if ! _nr_validate_segment_response "$header_file" "$metadata_file" "$start" "$end" "$total"; then
-    return 1
-  fi
-  return 0
-}
-
 run_url_download() {
   local url=${1-}
   local transport=direct
@@ -264,8 +388,8 @@ run_url_download() {
   local probe_header probe_metadata total
   local full_header full_metadata
   local remaining segment_count base extra cursor i length start end
-  local overall=0 pid
-  local -a pids=() segment_headers=() segment_metadata=()
+  local overall=0 pid transfer_pid
+  local -a pids=() segment_headers=() segment_metadata=() segment_starts=() segment_ends=()
 
   if [[ -z $url ]]; then
     printf 'URL download skipped: URL is empty.\n'
@@ -278,23 +402,30 @@ run_url_download() {
     transport=proxy
   fi
 
-  temp_prefix="${TMPDIR:-/tmp}/network-runtime.$$.$RANDOM"
+  _NR_RUNTIME_DIR=
+  _NR_ACTIVE_PIDS=()
+  if ! _NR_RUNTIME_DIR=$(_nr_create_runtime_dir); then
+    return 1
+  fi
+  temp_prefix="$_NR_RUNTIME_DIR/network-runtime"
 
   if (( DOWNLOAD_THREADS == 1 )); then
     full_header="$temp_prefix.full.headers"
     full_metadata="$temp_prefix.full.metadata"
     _nr_remove_files "$full_header" "$full_metadata"
-    if ! _nr_run_curl "$full_header" "$full_metadata" "$url" ''; then
-      _nr_remove_files "$full_header" "$full_metadata"
+    _nr_start_curl "$full_header" "$full_metadata" "$url" ''
+    transfer_pid=$_NR_LAST_PID
+    if ! _nr_wait_curl "$transfer_pid"; then
+      _nr_cleanup_runtime
       printf 'ERROR: complete URL download failed.\n' >&2
       return 1
     fi
     if ! total=$(_nr_validate_full_response "$full_metadata"); then
-      _nr_remove_files "$full_header" "$full_metadata"
+      _nr_cleanup_runtime
       printf 'ERROR: complete URL download returned invalid HTTP metadata.\n' >&2
       return 1
     fi
-    _nr_remove_files "$full_header" "$full_metadata"
+    _nr_cleanup_runtime
     printf 'URL download complete: total bytes=%s, concurrent segments=1, transport=%s\n' \
       "$total" "$transport"
     return 0
@@ -303,13 +434,15 @@ run_url_download() {
   probe_header="$temp_prefix.probe.headers"
   probe_metadata="$temp_prefix.probe.metadata"
   _nr_remove_files "$probe_header" "$probe_metadata"
-  if ! _nr_run_curl "$probe_header" "$probe_metadata" "$url" '0-0'; then
-    _nr_remove_files "$probe_header" "$probe_metadata"
+  _nr_start_curl "$probe_header" "$probe_metadata" "$url" '0-0'
+  transfer_pid=$_NR_LAST_PID
+  if ! _nr_wait_curl "$transfer_pid"; then
+    _nr_cleanup_runtime
     printf 'ERROR: Range probe curl command failed; refusing segmented download.\n' >&2
     return 1
   fi
   if ! total=$(_nr_validate_probe_response "$probe_header" "$probe_metadata"); then
-    _nr_remove_files "$probe_header" "$probe_metadata"
+    _nr_cleanup_runtime
     printf 'ERROR: Range probe validation failed; refusing segmented download.\n' >&2
     return 1
   fi
@@ -333,25 +466,29 @@ run_url_download() {
     end=$((cursor + length - 1))
     segment_headers[i]="$temp_prefix.segment.$i.headers"
     segment_metadata[i]="$temp_prefix.segment.$i.metadata"
+    segment_starts[i]=$start
+    segment_ends[i]=$end
     _nr_remove_files "${segment_headers[i]}" "${segment_metadata[i]}"
-    _nr_download_segment "$url" "$start" "$end" "$total" \
-      "${segment_headers[i]}" "${segment_metadata[i]}" &
-    pids[i]=$!
+    _nr_start_curl "${segment_headers[i]}" "${segment_metadata[i]}" "$url" "$start-$end"
+    pids[i]=$_NR_LAST_PID
     cursor=$((end + 1))
   done
 
-  for pid in "${pids[@]}"; do
-    if wait "$pid"; then
-      :
+  for ((i = 0; i < segment_count; i++)); do
+    pid=${pids[i]}
+    if _nr_wait_curl "$pid"; then
+      if ! _nr_validate_segment_response \
+        "${segment_headers[i]}" "${segment_metadata[i]}" \
+        "${segment_starts[i]}" "${segment_ends[i]}" "$total"; then
+        overall=1
+      fi
     else
+      printf 'ERROR: URL segment curl command failed.\n' >&2
       overall=1
     fi
   done
 
-  _nr_remove_files "$probe_header" "$probe_metadata"
-  for ((i = 0; i < segment_count; i++)); do
-    _nr_remove_files "${segment_headers[i]}" "${segment_metadata[i]}"
-  done
+  _nr_cleanup_runtime
 
   if (( overall != 0 )); then
     printf 'ERROR: one or more URL range segments failed; download aborted.\n' >&2
@@ -382,9 +519,9 @@ run_cf_speedtest_proxy() {
     return 0
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
-    PROXYCHAINS_CONF_FILE="$PROXY_CONFIG" proxychains4 cf_speedtest --download-only "$@"
+    proxychains4 cf_speedtest --download-only "$@"
   else
-    PROXYCHAINS_CONF_FILE="$PROXY_CONFIG" proxychains4 cf_speedtest "$@"
+    proxychains4 cf_speedtest "$@"
   fi
 }
 
