@@ -85,8 +85,8 @@ portability_contract() {
 
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
-    local shell_step image_step url_step only_down_step empty_proxy_step sigterm_step
-    local shell_input image_input url_input only_down_input empty_proxy_input sigterm_input
+    local shell_step image_step url_step only_down_step empty_proxy_step initial_step sigterm_step
+    local shell_input image_input url_input only_down_input empty_proxy_input initial_input sigterm_input
     require_file "$file" || return 1
 
     require_line "$file" 'name: container' 'workflow name' || return 1
@@ -136,9 +136,26 @@ workflow_contract() {
     require_line "$url_input" "-e PROXY_CONFIG=''" 'direct URL empty proxy' || return 1
     require_line "$url_input" '-e DOWNLOAD_THREADS=4' 'direct URL four workers' || return 1
     require_line "$url_input" 'https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz' 'exact default URL smoke asset' || return 1
+    require_line "$url_input" '-e WAIT_TIME=300' 'built-image URL long wait' || return 1
+    require_line "$url_input" '-e HTTP_PROXY='\''poison-HTTP_PROXY'\''' 'built-image HTTP_PROXY poison' || return 1
+    require_line "$url_input" '-e HTTPS_PROXY='\''poison-HTTPS_PROXY'\''' 'built-image HTTPS_PROXY poison' || return 1
+    require_line "$url_input" '-e ALL_PROXY='\''poison-ALL_PROXY'\''' 'built-image ALL_PROXY poison' || return 1
+    require_line "$url_input" '-e NO_PROXY='\''poison-NO_PROXY'\''' 'built-image NO_PROXY poison' || return 1
+    require_line "$url_input" '-e http_proxy='\''poison-http_proxy'\''' 'built-image http_proxy poison' || return 1
+    require_line "$url_input" '-e https_proxy='\''poison-https_proxy'\''' 'built-image https_proxy poison' || return 1
+    require_line "$url_input" '-e all_proxy='\''poison-all_proxy'\''' 'built-image all_proxy poison' || return 1
+    require_line "$url_input" '-e no_proxy='\''poison-no_proxy'\''' 'built-image no_proxy poison' || return 1
     require_line "$url_input" 'timeout 180s bash -c' 'bounded built-image URL smoke' || return 1
     require_line "$url_input" 'URL download complete: total bytes=15152253, concurrent segments=4, transport=direct' 'exact direct URL summary' || return 1
+    require_line "$url_input" 'timeout 10s docker stop --time 5 "$url_container"' 'built-image URL bounded stop' || return 1
+    require_line "$url_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$url_container"' 'built-image URL stopped-state check' || return 1
+    require_line "$url_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$url_container"' 'built-image URL exit-code check' || return 1
+    require_line "$url_input" 'url_logs=$(docker logs "$url_container" 2>&1 || true)' 'built-image URL post-stop log reread' || return 1
     require_line "$url_input" 'grep -Fxc -- "$summary" <<<"$url_logs"' 'single-line URL summary assertion' || return 1
+    if grep -Fq -- '-e WAIT_TIME=1' <<<"$url_input"; then
+        printf 'FAIL: built-image URL smoke still uses WAIT_TIME=1\n' >&2
+        return 1
+    fi
     require_line "$url_input" 'grep -Fq -- "$url_url" <<<"$url_logs"' 'URL redaction assertion' || return 1
     require_line "$url_input" "'saved'" 'download progress noise assertion' || return 1
     require_line "$url_input" "'%'" 'percentage progress noise assertion' || return 1
@@ -152,17 +169,34 @@ workflow_contract() {
     require_line "$only_down_input" '-e RUN_SPEEDTEST_DIRECT=true' 'download-only direct toggle' || return 1
     require_line "$only_down_input" '-e RUN_SPEEDTEST_PROXY=false' 'download-only proxy toggle' || return 1
     require_line "$only_down_input" "-e PROXY_CONFIG=''" 'download-only empty proxy' || return 1
+    require_line "$only_down_input" "-e HTTP_PROXY='poison-HTTP_PROXY'" 'download-only HTTP_PROXY poison' || return 1
+    require_line "$only_down_input" "-e HTTPS_PROXY='poison-HTTPS_PROXY'" 'download-only HTTPS_PROXY poison' || return 1
+    require_line "$only_down_input" "-e ALL_PROXY='poison-ALL_PROXY'" 'download-only ALL_PROXY poison' || return 1
+    require_line "$only_down_input" "-e NO_PROXY='poison-NO_PROXY'" 'download-only NO_PROXY poison' || return 1
+    require_line "$only_down_input" "-e http_proxy='poison-http_proxy'" 'download-only http_proxy poison' || return 1
+    require_line "$only_down_input" "-e https_proxy='poison-https_proxy'" 'download-only https_proxy poison' || return 1
+    require_line "$only_down_input" "-e all_proxy='poison-all_proxy'" 'download-only all_proxy poison' || return 1
+    require_line "$only_down_input" "-e no_proxy='poison-no_proxy'" 'download-only no_proxy poison' || return 1
     require_line "$only_down_input" "-e URL_DDL=''" 'download-only empty URL' || return 1
     require_line "$only_down_input" '-e SPEEDTEST_DOWNLOAD_ONLY=true' 'download-only mode toggle' || return 1
     require_line "$only_down_input" '-e DOWNLOAD_THREADS=4' 'download-only four workers' || return 1
     require_line "$only_down_input" '-e WAIT_TIME=30' 'download-only bounded wait setting' || return 1
+    require_line "$only_down_input" 'for proxy_key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do' 'download-only proxy poison audit' || return 1
+    require_line "$only_down_input" 'if printenv "$proxy_key" >/dev/null 2>&1; then' 'download-only proxy poison fail-fast' || return 1
+    require_line "$only_down_input" '/tmp/speedtest-diy-fake-state/cf.calls' 'download-only fake logs after proxy audit' || return 1
+    require_line "$only_down_input" '/tmp/speedtest-diy-fake-state/cf.pid' 'download-only held fake marker' || return 1
+    require_line "$only_down_input" 'trap '\'':'\'' TERM INT' 'download-only fake ignores TERM' || return 1
+    require_line "$only_down_input" 'while [[ ! -e /tmp/speedtest-diy-fake-state/release-cf ]]; do' 'download-only fake holds in flight' || return 1
     require_line "$only_down_input" 'timeout 90s bash -c' 'bounded download-only smoke' || return 1
     require_line "$only_down_input" 'Starting direct speed test (download-only, 10 sec)' 'download-only start assertion' || return 1
     require_line "$only_down_input" 'grep -Fq -- '\''--download-only'\'' "$fake_state/cf.calls"' 'download-only fake argument assertion' || return 1
     require_line "$only_down_input" 'grep -Fq -- '\''--download-threads 4'\'' "$fake_state/cf.calls"' 'download thread fake argument assertion' || return 1
+    require_line "$only_down_input" '[ -s "$fake_state/cf.pid" ]' 'download-only held process assertion' || return 1
     require_line "$only_down_input" 'Starting direct speed test (download and upload' 'both-direction log prohibition' || return 1
     require_line "$only_down_input" 'timeout 10s docker stop --time 5 "$only_down_container"' 'download-only bounded stop' || return 1
+    require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$only_down_container")" = false ]' 'download-only stopped-state assertion' || return 1
     require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$only_down_container")" = 0 ]' 'download-only exit code assertion' || return 1
+    require_line "$only_down_input" 'only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)' 'download-only post-stop log reread' || return 1
     require_line "$only_down_input" 'Stop requested. Cleaning up and exiting...' 'download-only English shutdown assertion' || return 1
     require_line "$only_down_input" 'Arrêt du script demandé.' 'French shutdown prohibition' || return 1
     require_line "$only_down_input" 'rm -rf -- "$fake_root"' 'download-only fake trap cleanup' || return 1
@@ -180,23 +214,47 @@ workflow_contract() {
     require_line "$empty_proxy_input" '[ ! -e "$empty_proxy_state/cf.calls" ]' 'empty-proxy fake marker absence assertion' || return 1
     require_line "$empty_proxy_input" 'Waiting 30 seconds before running the tests again...' 'empty-proxy wait reached assertion' || return 1
     require_line "$empty_proxy_input" 'timeout 10s docker stop --time 5 "$empty_proxy_container"' 'empty-proxy bounded stop' || return 1
+    require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$empty_proxy_container")" = false ]' 'empty-proxy stopped-state assertion' || return 1
     require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$empty_proxy_container")" = 0 ]' 'empty-proxy exit code assertion' || return 1
     require_line "$empty_proxy_input" 'Stop requested. Cleaning up and exiting...' 'empty-proxy English shutdown assertion' || return 1
     require_line "$empty_proxy_input" 'rm -rf -- "$empty_proxy_root"' 'empty-proxy fake trap cleanup' || return 1
 
     sigterm_step=$(extract_step "$file" build-and-smoke 'Verify SIGTERM shutdown')
     sigterm_input=$(printf '%s\n' "$sigterm_step")
+    require_line "$sigterm_input" 'fake_root=' 'default smoke fake state setup' || return 1
+    require_line "$sigterm_input" '--mount type=bind,src="$fake_cf",dst=/usr/local/bin/cf_speedtest,readonly' 'default smoke fake binary mount' || return 1
+    require_line "$sigterm_input" "-e URL_DDL=''" 'default smoke empty URL' || return 1
+    if grep -Fq -- 'RUN_SPEEDTEST_DIRECT' <<<"$sigterm_input" ||
+        grep -Fq -- 'RUN_SPEEDTEST_PROXY' <<<"$sigterm_input"; then
+        printf 'FAIL: default lifecycle smoke overrides image speed-test defaults\n' >&2
+        return 1
+    fi
     require_line "$sigterm_input" 'Starting in 5 seconds...' 'English initial smoke marker' || return 1
     require_line "$sigterm_input" 'Direct speed test disabled.' 'English direct-disabled smoke marker' || return 1
     require_line "$sigterm_input" 'Proxy speed test disabled.' 'English proxy-disabled smoke marker' || return 1
     require_line "$sigterm_input" 'URL_DDL is empty. Download skipped.' 'English empty-URL smoke marker' || return 1
     require_line "$sigterm_input" 'Waiting 30 seconds before running the tests again...' 'English wait smoke marker' || return 1
+    require_line "$sigterm_input" '[ ! -e "$fake_state/cf.calls" ]' 'default smoke fake was never called' || return 1
     require_line "$sigterm_input" 'Arrêt du script demandé.' 'French log prohibition' || return 1
     require_line "$sigterm_input" 'Stop requested. Cleaning up and exiting...' 'English shutdown log assertion' || return 1
     require_line "$sigterm_input" 'timeout 10s docker stop --time 5' 'bounded SIGTERM smoke' || return 1
     require_line "$sigterm_input" 'logs=$(docker logs "$container_id" 2>&1 || true)' 'post-stop Docker log reread' || return 1
     require_line "$sigterm_input" "docker inspect -f '{{.State.Running}}' \"\$container_id\"" 'post-stop State.Running check' || return 1
+    require_line "$sigterm_input" "docker inspect -f '{{.State.ExitCode}}' \"\$container_id\"" 'post-stop ExitCode check' || return 1
     require_line "$sigterm_input" '= false ]' 'post-stop stopped-state assertion' || return 1
+
+    initial_step=$(extract_step "$file" build-and-smoke 'Verify SIGTERM during initial wait')
+    initial_input=$(printf '%s\n' "$initial_step")
+    require_line "$initial_input" 'initial_container=' 'initial-wait smoke container' || return 1
+    require_line "$initial_input" "-e URL_DDL=''" 'initial-wait empty URL' || return 1
+    require_line "$initial_input" 'Starting in 5 seconds...' 'initial-wait marker' || return 1
+    require_line "$initial_input" 'timeout 15s bash -c' 'bounded initial-wait polling' || return 1
+    require_line "$initial_input" 'timeout 10s docker stop --time 5 "$initial_container"' 'initial-wait bounded stop' || return 1
+    require_line "$initial_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$initial_container"' 'initial-wait stopped-state assertion' || return 1
+    require_line "$initial_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$initial_container")" = 0 ]' 'initial-wait exit code assertion' || return 1
+    require_line "$initial_input" 'initial_logs=$(docker logs "$initial_container" 2>&1 || true)' 'initial-wait post-stop log reread' || return 1
+    require_line "$initial_input" 'Stop requested. Cleaning up and exiting...' 'initial-wait English shutdown' || return 1
+    require_line "$initial_input" 'docker rm -f "$initial_container"' 'initial-wait minimal cleanup' || return 1
 }
 
 anonymous_ghcr_contract() {
@@ -219,7 +277,12 @@ anonymous_ghcr_contract() {
         'unset DOCKER_AUTH_CONFIG' \
         'GITHUB_SHA::7' \
         'docker pull --platform linux/amd64 "$sha_image"' \
-        'docker pull --platform linux/amd64 "$latest_image"' \
+        'sha_id=$(docker image inspect --format '\''{{.Id}}'\'' "$sha_image")' \
+        'case "$GITHUB_REF" in' \
+        'refs/heads/main)' \
+        'refs/tags/v*)' \
+        'latest_id=$(docker image inspect --format '\''{{.Id}}'\'' "$latest_image")' \
+        '[ "$latest_id" = "$sha_id" ]' \
         'docker run -d --name "$sha_container" --platform linux/amd64' \
         'RUN_SPEEDTEST_DIRECT=false' \
         'RUN_SPEEDTEST_PROXY=false' \
@@ -233,25 +296,62 @@ anonymous_ghcr_contract() {
         fi
     done
 
+    if ! awk '
+        /case "\$GITHUB_REF" in/ { in_case=1 }
+        in_case && /refs\/heads\/main\)/ { in_main=1 }
+        in_main && /docker pull --platform linux\/amd64 "\$latest_image"/ { latest_pull=1 }
+        in_main && /docker image inspect --format/ && /"\$latest_image"/ { latest_inspect=1 }
+        in_main && /refs\/tags\/v\*\)/ { tag_branch=1 }
+        END { exit !(in_case && in_main && latest_pull && latest_inspect && tag_branch) }
+    ' <<<"$job"; then
+        printf 'FAIL: latest image operations are not confined to the main branch\n' >&2
+        return 1
+    fi
+
     public_step=$(extract_step "$file" verify-public-pull 'Pull, inspect, and run GHCR images anonymously')
     public_input=$(printf '%s\n' "$public_step")
-    require_line "$public_input" 'docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$latest_image" -c' 'public helper inspection invocation' || return 1
+    require_line "$public_input" 'sha_id=$(docker image inspect --format '\''{{.Id}}'\'' "$sha_image")' 'public SHA image inspection' || return 1
+    require_line "$public_input" 'docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$sha_image" -c' 'public SHA helper inspection invocation' || return 1
     require_line "$public_input" 'test -x /usr/local/bin/network-runtime.sh' 'public network helper inspection' || return 1
     require_line "$public_input" 'test -x "$(command -v curl)"' 'public curl inspection' || return 1
     require_line "$public_input" 'test -s /etc/ssl/certs/ca-certificates.crt' 'public CA inspection' || return 1
-    require_line "$public_input" 'latest_url_container="speedtest-diy-public-url-${GITHUB_RUN_ID:-local}"' 'named public URL container' || return 1
-    require_line "$public_input" '--name "$latest_url_container"' 'named public URL smoke container' || return 1
+    require_line "$public_input" 'sha_url_container="speedtest-diy-published-sha-url-${GITHUB_RUN_ID:-local}"' 'named published SHA URL container' || return 1
+    require_line "$public_input" '--name "$sha_url_container"' 'named SHA URL smoke container' || return 1
+    require_line "$public_input" '"$sha_image" >/dev/null' 'public SHA URL image selection' || return 1
     require_line "$public_input" "-e PROXY_CONFIG=''" 'public direct empty proxy' || return 1
     require_line "$public_input" '-e DOWNLOAD_THREADS=4' 'public direct four workers' || return 1
+    require_line "$public_input" '-e WAIT_TIME=300' 'public URL long wait' || return 1
+    require_line "$public_input" '-e HTTP_PROXY='\''poison-HTTP_PROXY'\''' 'public HTTP_PROXY poison' || return 1
+    require_line "$public_input" '-e HTTPS_PROXY='\''poison-HTTPS_PROXY'\''' 'public HTTPS_PROXY poison' || return 1
+    require_line "$public_input" '-e ALL_PROXY='\''poison-ALL_PROXY'\''' 'public ALL_PROXY poison' || return 1
+    require_line "$public_input" '-e NO_PROXY='\''poison-NO_PROXY'\''' 'public NO_PROXY poison' || return 1
+    require_line "$public_input" '-e http_proxy='\''poison-http_proxy'\''' 'public http_proxy poison' || return 1
+    require_line "$public_input" '-e https_proxy='\''poison-https_proxy'\''' 'public https_proxy poison' || return 1
+    require_line "$public_input" '-e all_proxy='\''poison-all_proxy'\''' 'public all_proxy poison' || return 1
+    require_line "$public_input" '-e no_proxy='\''poison-no_proxy'\''' 'public no_proxy poison' || return 1
     require_line "$public_input" 'https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz' 'public exact default URL' || return 1
     require_line "$public_input" 'timeout 180s bash -c' 'bounded public URL smoke' || return 1
     require_line "$public_input" 'URL download complete: total bytes=15152253, concurrent segments=4, transport=direct' 'public exact summary' || return 1
-    require_line "$public_input" 'grep -Fxc -- "$summary" <<<"$latest_logs"' 'public one-line summary assertion' || return 1
-    require_line "$public_input" 'grep -Fq -- "$latest_url" <<<"$latest_logs"' 'public URL redaction assertion' || return 1
+    require_line "$public_input" 'timeout 10s docker stop --time 5 "$sha_url_container"' 'public URL bounded stop' || return 1
+    require_line "$public_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$sha_url_container"' 'public URL stopped-state assertion' || return 1
+    require_line "$public_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$sha_url_container"' 'public URL exit-code assertion' || return 1
+    require_line "$public_input" 'sha_url_logs=$(docker logs "$sha_url_container" 2>&1 || true)' 'public URL post-stop log reread' || return 1
+    require_line "$public_input" 'grep -Fxc -- "$summary" <<<"$sha_url_logs"' 'public one-line summary assertion' || return 1
+    require_line "$public_input" 'grep -Fq -- "$sha_url" <<<"$sha_url_logs"' 'public URL redaction assertion' || return 1
     require_line "$public_input" "'saved'" 'public progress noise assertion' || return 1
-    require_line "$public_input" "'%'" 'public percentage noise assertion' || return 1
+    require_line "$public_input" "'%'" 'public percentage progress noise assertion' || return 1
     require_line "$public_input" 'docker rm -f "$sha_container"' 'sha container trap cleanup' || return 1
-    require_line "$public_input" 'docker rm -f "$latest_url_container"' 'public URL trap cleanup' || return 1
+    require_line "$public_input" 'docker rm -f "$sha_url_container"' 'public SHA URL trap cleanup' || return 1
+    if grep -Fq -- 'latest_url_container' <<<"$job" ||
+        grep -Fq -- 'latest_url=' <<<"$public_input" ||
+        grep -Fq -- '"$latest_image" >/dev/null' <<<"$public_input"; then
+        printf 'FAIL: public verification uses a misleading or unconditional latest URL image\n' >&2
+        return 1
+    fi
+    if grep -Fq -- '-e WAIT_TIME=1' <<<"$public_input"; then
+        printf 'FAIL: public URL smoke still uses WAIT_TIME=1\n' >&2
+        return 1
+    fi
     if grep -Fq -- '${{ runner.temp }}' <<<"$job"; then
         printf 'FAIL: anonymous GHCR job uses forbidden runner context\n' >&2
         return 1
@@ -296,7 +396,7 @@ compose_contract() {
         '    network_mode: host' \
         '    restart: unless-stopped' \
         '    environment:' \
-        '      URL_DDL: "${URL_DDL:-https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz}"' \
+        '      URL_DDL: "${URL_DDL-https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz}"' \
         '      WAIT_TIME_MIN: "${WAIT_TIME_MIN:-5}"' \
         '      WAIT_TIME_MAX: "${WAIT_TIME_MAX:-50}"' \
         '      TEST_DURATION: "${TEST_DURATION:-10}"' \
@@ -314,6 +414,7 @@ compose_contract() {
     done
     require_no_line "$file" 'ai.here.link' 'Compose legacy ai.here.link URL' || return 1
     require_no_line "$file" 'socks5 127.0.0.1 9100' 'Compose synthesized localhost proxy' || return 1
+    require_no_line "$file" '${URL_DDL:-' 'Compose empty URL must not fall back to default' || return 1
     if grep -nE '^[[:space:]]*(ports|volumes):' "$file"; then
         printf 'FAIL: Compose contract (ports/volumes are forbidden)\n' >&2
         return 1
@@ -356,6 +457,9 @@ documentation_contract() {
         '`probe` 计入 `byte 0`，所有响应体都写入 `/dev/null`，因此总响应体仍是一个对象。' \
         'Range 不受支持或响应不匹配时 fail closed；不会退回 N 个完整 GET。' \
         'HTTP 元数据只在私有临时目录短暂保存，并在结束、失败或取消时清理' \
+        '`URL_DDL` 和 `cf_speedtest` 的子进程都会清除 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`、`http_proxy`、`https_proxy`、`all_proxy`、`no_proxy` 八个环境变量' \
+        'curl 使用 `--disable --noproxy '\''*'\''`，因此不读取 `.curlrc`。' \
+        '只有显式非空 `PROXY_CONFIG` 才选择 `proxychains4`' \
         '`PROXY_CONFIG` 未设置或为空时，URL_DDL 直连；非空时通过 `proxychains4`。' \
         'RUN_SPEEDTEST_PROXY=true 但 PROXY_CONFIG 为空时只输出英文 warning 并跳过，绝不意外直连。' \
         '`RUN_SPEEDTEST_DIRECT=true` 表示通过直连执行 `cf_speedtest`。' \
@@ -363,6 +467,8 @@ documentation_contract() {
         'true` 时传给 `cf_speedtest` `--download-only`，且不执行 upload 阶段' \
         '`UPLOAD_THREADS` 在 only-down 模式下不生效。' \
         '默认关闭两类 cf_speedtest，URL_DDL 直连：' \
+        '镜像默认 `RUN_SPEEDTEST_DIRECT=false`、`RUN_SPEEDTEST_PROXY=false`。' \
+        '只有在 `URL_DDL` 未设置时，Compose 才填入固定默认 URL；显式 `URL_DDL=` 保持为空并禁用下载。' \
         '### (a) 默认：直连 URL_DDL' '### (b) 代理 URL_DDL' '### (c) 直连 download-only speedtest' \
         'PROXY_CONFIG="socks5 192.0.2.10 9100"' \
         'RUN_SPEEDTEST_DIRECT=true' 'SPEEDTEST_DOWNLOAD_ONLY=true' \
@@ -378,7 +484,10 @@ documentation_contract() {
         '用户可见自有运行日志统一为英文' \
         'Docker Hub API' 'source' '公开描述未声明许可证' \
         'verify-public-pull' 'docker pull' 'docker run' '匿名' 'Public' \
-        '真实网络流量' '带宽'; do
+        '真实网络流量' '带宽' \
+        'sha-${GITHUB_SHA::7}' \
+        '仅在 `main` 上额外拉取 `latest`，并要求其 Docker image ID 与 SHA 镜像 ID 相同；`v*` tag 不拉取也不使用 `latest`；' \
+        '默认 URL smoke 对 main 和 tag 都使用 SHA 镜像。'; do
         require_line "$file" "$needle" "README contract" || return 1
     done
     for obsolete in \

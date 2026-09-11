@@ -24,7 +24,7 @@ docker run --rm --platform linux/amd64 --network host \
   ghcr.io/wujun8/speedtest-diy:local
 ```
 
-镜像只面向 `linux/amd64`。默认入口会先等待 5 秒，再按等待配置运行启用的任务。
+镜像只面向 `linux/amd64`。默认入口会先等待 5 秒。镜像默认 `RUN_SPEEDTEST_DIRECT=false`、`RUN_SPEEDTEST_PROXY=false`。只有显式设置为 `true` 才运行对应的 `cf_speedtest` 任务。
 
 ## URL_DDL 下载与连接并发
 
@@ -36,6 +36,8 @@ docker run --rm --platform linux/amd64 --network host \
 - Range 不受支持或响应不匹配时 fail closed；不会退回 N 个完整 GET。
 - HTTP 元数据只在私有临时目录短暂保存，并在结束、失败或取消时清理；不会生成 payload 文件。
 - `PROXY_CONFIG` 未设置或为空时，URL_DDL 直连；非空时通过 `proxychains4`。
+
+`URL_DDL` 和 `cf_speedtest` 的子进程都会清除 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`、`http_proxy`、`https_proxy`、`all_proxy`、`no_proxy` 八个环境变量；curl 使用 `--disable --noproxy '*'`，因此不读取 `.curlrc`。只有显式非空 `PROXY_CONFIG` 才选择 `proxychains4`，ambient proxy 环境变量不会改变传输选择。
 
 下载会真实消耗带宽。尤其是默认 GitHub CLI 资产和较大的自定义 URL，频繁运行可能消耗流量配额并触发服务端限流；请按网络和服务条款选择等待间隔。
 
@@ -50,7 +52,7 @@ docker run --rm --platform linux/amd64 --network host \
 
 ## Compose 仅 URL_DDL 下载
 
-`compose.yaml` 保留 `network_mode: host`、`restart: unless-stopped` 和 `linux/amd64` 平台设置，不挂载 volumes，也不发布 ports。Compose 默认关闭两类 cf_speedtest，URL_DDL 直连：`RUN_SPEEDTEST_DIRECT=false`、`RUN_SPEEDTEST_PROXY=false`、`PROXY_CONFIG` 为空。
+`compose.yaml` 保留 `network_mode: host`、`restart: unless-stopped` 和 `linux/amd64` 平台设置，不挂载 volumes，也不发布 ports。Compose 默认关闭两类 cf_speedtest，URL_DDL 直连：`RUN_SPEEDTEST_DIRECT=false`、`RUN_SPEEDTEST_PROXY=false`、`PROXY_CONFIG` 为空。只有在 `URL_DDL` 未设置时，Compose 才填入固定默认 URL；显式 `URL_DDL=` 保持为空并禁用下载。
 
 启动、查看日志和停止：
 
@@ -153,9 +155,9 @@ docker run --rm --platform linux/amd64 --network host \
 
 发布 job 成功后，`verify-public-pull` 会在不执行任何 GHCR 登录的前提下，使用临时空的 `DOCKER_CONFIG` 匿名执行：
 
-1. `docker pull` 发布的 `sha-<7 位提交短 SHA>` 标签；
-2. `docker pull` `latest` 标签；
-3. 检查公开镜像中的 runtime helper、curl 和 CA bundle；
-4. 在 `latest` 上以空 `PROXY_CONFIG` 运行一次受限的直连默认 URL helper smoke，并核对精确字节摘要。
+1. 在 `linux/amd64` 上始终拉取、inspect 并运行刚发布的 `sha-${GITHUB_SHA::7}` 镜像；
+2. 仅在 `main` 上额外拉取 `latest`，并要求其 Docker image ID 与 SHA 镜像 ID 相同；`v*` tag 不拉取也不使用 `latest`；
+3. 检查公开 SHA 镜像中的 runtime helper、curl 和 CA bundle；
+4. 在 SHA 镜像上以空 `PROXY_CONFIG` 运行一次受限的直连默认 URL smoke，并核对精确字节摘要。默认 URL smoke 对 main 和 tag 都使用 SHA 镜像。
 
 GHCR package 必须设置为 **Public**，否则匿名 `docker pull` 会失败；Actions workflow 不会替你修改 package 可见性。验收仍明确限定为 `linux/amd64`。
