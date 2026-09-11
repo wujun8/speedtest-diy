@@ -186,8 +186,13 @@ dockerfile_contract() {
     local file=$ROOT/Dockerfile
     require_file "$file" || return 1
     require_line "$file" 'FROM --platform=linux/amd64 zephir284/speedtest@sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' 'frozen amd64 base' || return 1
+    require_line "$file" 'apt-get update' 'APT package index update' || return 1
+    require_line "$file" 'apt-get install -y --no-install-recommends curl ca-certificates' 'curl and CA package install' || return 1
+    require_line "$file" 'rm -rf /var/lib/apt/lists/*' 'APT list cleanup' || return 1
     require_line "$file" 'COPY random-wait.sh /usr/local/bin/random-wait.sh' 'random helper image copy' || return 1
+    require_line "$file" 'COPY network-runtime.sh /usr/local/bin/network-runtime.sh' 'network helper image copy' || return 1
     require_line "$file" 'COPY patch-entrypoint.sh /usr/local/bin/patch-entrypoint.sh' 'patch helper image copy' || return 1
+    require_line "$file" 'chmod 0755 /usr/local/bin/random-wait.sh /usr/local/bin/network-runtime.sh /usr/local/bin/patch-entrypoint.sh' 'runtime helper modes' || return 1
     require_line "$file" '/usr/local/bin/patch-entrypoint.sh /entrypoint.sh' 'build-time patch' || return 1
     require_line "$file" 'ENTRYPOINT ["/entrypoint.sh"]' 'upstream entrypoint' || return 1
     require_no_line "$file" 'arm64' 'Dockerfile architecture scope' || return 1
@@ -289,6 +294,7 @@ notice_contract() {
 
 run_group 'test fixture portability' portability_contract
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
+run_group 'network runtime behavior' bash "$ROOT/tests/test_network_runtime.sh"
 run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"
 run_group 'workflow static contract' workflow_contract
 run_group 'anonymous GHCR pull/run static contract' anonymous_ghcr_contract
