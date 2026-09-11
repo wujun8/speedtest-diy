@@ -142,15 +142,16 @@ if [[ "${FAKE_REQUIRE_URL_BOUNDARY:-false}" == 'true' && -z "$url" ]]; then
 fi
 
 if [[ "${FAKE_RACE_CURL:-false}" == 'true' ]]; then
-  printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
   if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
     line=''
     term_count=0
     trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-curl"' TERM INT
+    printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
     while :; do
       IFS= read -r -t 0.05 line < /dev/zero || :
     done
   fi
+  printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
   exec sleep 60
 fi
 
@@ -322,15 +323,16 @@ cat > "$FAKE_BIN/race-worker" <<'FAKE_RACE'
 set -u
 
 : "${FAKE_STATE:?FAKE_STATE is required}"
-printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
 if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
   line=''
   term_count=0
   trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-run"' TERM INT
+  printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
   while :; do
     IFS= read -r -t 0.05 line < /dev/zero || :
   done
 fi
+printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
 exec sleep 60
 FAKE_RACE
 chmod +x "$FAKE_BIN/race-worker"
