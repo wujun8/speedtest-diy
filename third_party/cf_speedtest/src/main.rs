@@ -3,7 +3,7 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use std::io::Read;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,6 +114,75 @@ impl RequestGateState {
     }
 }
 
+const REQUEST_START_SPACING_MS: u64 = 250;
+
+#[derive(Debug, Default)]
+struct RuntimeRequestGateState {
+    next_start_ms: u64,
+    retry_deadline_ms: u64,
+}
+
+struct RuntimeRequestGate {
+    state: Mutex<RuntimeRequestGateState>,
+}
+
+impl RuntimeRequestGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RuntimeRequestGateState::default()),
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, RuntimeRequestGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("runtime request gate mutex is poisoned"))
+    }
+
+    fn extend_retry_deadline_ms(&self, deadline_ms: u64) {
+        let mut state = self.lock_state();
+        state.retry_deadline_ms = state.retry_deadline_ms.max(deadline_ms);
+    }
+
+    fn wait_for_start_with<N, S>(&self, mut now_ms: N, mut sleeper: S) -> u64
+    where
+        N: FnMut() -> u64,
+        S: FnMut(u64),
+    {
+        let (mut reserved_start_ms, mut observed_retry_deadline_ms) = {
+            let mut state = self.lock_state();
+            let retry_deadline_ms = state.retry_deadline_ms;
+            let start_ms = now_ms().max(state.next_start_ms).max(retry_deadline_ms);
+            state.next_start_ms = start_ms.saturating_add(REQUEST_START_SPACING_MS);
+            (start_ms, retry_deadline_ms)
+        };
+
+        loop {
+            let now = now_ms();
+            let mut state = self.lock_state();
+            if state.retry_deadline_ms > observed_retry_deadline_ms {
+                reserved_start_ms = reserved_start_ms
+                    .max(state.retry_deadline_ms)
+                    .max(state.next_start_ms);
+                state.next_start_ms = reserved_start_ms.saturating_add(REQUEST_START_SPACING_MS);
+                observed_retry_deadline_ms = state.retry_deadline_ms;
+            }
+
+            if now >= reserved_start_ms {
+                let actual_start_ms = now;
+                state.next_start_ms = state
+                    .next_start_ms
+                    .max(actual_start_ms.saturating_add(REQUEST_START_SPACING_MS));
+                return actual_start_ms;
+            }
+
+            let delay_ms = reserved_start_ms - now;
+            drop(state);
+            sleeper(delay_ms);
+        }
+    }
+}
+
 static MEAS_ID_SEED: OnceLock<u64> = OnceLock::new();
 static MEAS_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -157,6 +226,76 @@ enum AttemptFailure {
     HttpStatus(u16),
     Transport,
     InvalidBodyLength { expected: usize, actual: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectionStateSnapshot {
+    valid_sample_count: usize,
+    confirmed_bytes: usize,
+    measurements: Vec<TransferSample>,
+    terminal_error: Option<AttemptFailure>,
+}
+
+#[derive(Debug, Default)]
+struct DirectionStateInner {
+    valid_sample_count: usize,
+    confirmed_bytes: usize,
+    measurements: Vec<TransferSample>,
+    terminal_error: Option<AttemptFailure>,
+    stop: bool,
+}
+
+struct DirectionState {
+    inner: Mutex<DirectionStateInner>,
+}
+
+impl Default for DirectionState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(DirectionStateInner::default()),
+        }
+    }
+}
+
+impl DirectionState {
+    fn lock_inner(&self) -> MutexGuard<'_, DirectionStateInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("direction state mutex is poisoned"))
+    }
+
+    fn record_sample(&self, sample: TransferSample) {
+        let mut state = self.lock_inner();
+        if state.stop {
+            return;
+        }
+
+        state.valid_sample_count = state.valid_sample_count.saturating_add(1);
+        state.confirmed_bytes = state.confirmed_bytes.saturating_add(sample.bytes);
+        state.measurements.push(sample);
+    }
+
+    fn record_terminal_error(&self, failure: AttemptFailure) {
+        let mut state = self.lock_inner();
+        state.stop = true;
+        if state.terminal_error.is_none() {
+            state.terminal_error = Some(failure);
+        }
+    }
+
+    fn snapshot(&self) -> DirectionStateSnapshot {
+        let state = self.lock_inner();
+        DirectionStateSnapshot {
+            valid_sample_count: state.valid_sample_count,
+            confirmed_bytes: state.confirmed_bytes,
+            measurements: state.measurements.clone(),
+            terminal_error: state.terminal_error.clone(),
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.lock_inner().stop
+    }
 }
 
 fn transfer_sample(bytes: usize, started_at: Instant) -> TransferSample {
@@ -358,6 +497,108 @@ fn classify_direction_outcome(
         DirectionOutcome::SuccessTable
     } else {
         DirectionOutcome::NonZeroFailure
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectionRunResult {
+    SuccessTable,
+    TerminalFailure,
+    NoValidSamples,
+}
+
+impl DirectionRunResult {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::SuccessTable => 0,
+            Self::TerminalFailure => 1,
+            Self::NoValidSamples => 3,
+        }
+    }
+
+    fn has_success_table(self) -> bool {
+        matches!(self, Self::SuccessTable)
+    }
+}
+
+fn classify_direction_run_result(
+    direction: Direction,
+    download_state: &DirectionState,
+    upload_state: &DirectionState,
+) -> DirectionRunResult {
+    let download_snapshot = download_state.snapshot();
+    let upload_snapshot = upload_state.snapshot();
+
+    let requested_snapshots = match direction {
+        Direction::Download => vec![download_snapshot],
+        Direction::Upload => vec![upload_snapshot],
+        Direction::Both => vec![download_snapshot, upload_snapshot],
+    };
+
+    if requested_snapshots
+        .iter()
+        .any(|snapshot| snapshot.valid_sample_count == 0)
+    {
+        DirectionRunResult::NoValidSamples
+    } else if requested_snapshots
+        .iter()
+        .any(|snapshot| snapshot.terminal_error.is_some())
+    {
+        DirectionRunResult::TerminalFailure
+    } else {
+        DirectionRunResult::SuccessTable
+    }
+}
+
+fn run_worker_cycle<N, S, A>(
+    state: &DirectionState,
+    gate: &RuntimeRequestGate,
+    mut attempt: A,
+    mut now_ms: N,
+    mut sleeper: S,
+) -> std::result::Result<(), AttemptFailure>
+where
+    N: FnMut() -> u64,
+    S: FnMut(u64),
+    A: FnMut(u64) -> std::result::Result<TransferSample, AttemptFailure>,
+{
+    let policy = RetryPolicy::default();
+    let mut retry_index = 0;
+
+    loop {
+        if state.should_stop() {
+            return Ok(());
+        }
+
+        gate.wait_for_start_with(&mut now_ms, &mut sleeper);
+        if state.should_stop() {
+            return Ok(());
+        }
+
+        let meas_id = next_meas_id();
+        match attempt(meas_id) {
+            Ok(sample) => {
+                state.record_sample(sample);
+                return Ok(());
+            }
+            Err(failure) => {
+                if let AttemptFailure::RateLimited(retry_after) = &failure {
+                    match policy.decide(429, retry_after.as_deref(), retry_index) {
+                        RetryDecision::Retry { delay_secs } => {
+                            let delay_ms = delay_secs.saturating_mul(1_000);
+                            let retry_deadline_ms = now_ms().saturating_add(delay_ms);
+                            gate.extend_retry_deadline_ms(retry_deadline_ms);
+                            retry_index = retry_index.saturating_add(1);
+                            continue;
+                        }
+                        RetryDecision::Abort | RetryDecision::NoRetry => {}
+                    }
+                }
+
+                state.record_terminal_error(failure.clone());
+                return Err(failure);
+            }
+        }
     }
 }
 
