@@ -30,6 +30,33 @@ assert_not_contains() {
     esac
 }
 
+read_pid_marker() {
+    local pid_file=$1 pid_line='' pid_extra='' pid_fd
+    if [ ! -s "$pid_file" ]; then
+        return 1
+    fi
+    if ! exec {pid_fd}<"$pid_file"; then
+        return 1
+    fi
+    if ! IFS= read -r pid_line <&"$pid_fd"; then
+        exec {pid_fd}<&-
+        return 1
+    fi
+    case "$pid_line" in
+        ''|*[!0-9]*|0*)
+            exec {pid_fd}<&-
+            return 1
+            ;;
+    esac
+    if IFS= read -r pid_extra <&"$pid_fd"; then
+        exec {pid_fd}<&-
+        return 1
+    fi
+    exec {pid_fd}<&-
+    [ -z "$pid_extra" ] || return 1
+    printf '%s\n' "$pid_line"
+}
+
 SCRIPT=$ROOT/random-wait.sh
 if [ ! -f "$SCRIPT" ]; then
     fail "random-wait.sh is missing"
@@ -51,9 +78,10 @@ cleanup() {
     fi
     for pid_file in "$TMP_DIR"/*.sleep.pid; do
         if [ -f "$pid_file" ]; then
-            sleep_pid=$(<"$pid_file")
-            kill -KILL "$sleep_pid" 2>/dev/null || :
-            wait "$sleep_pid" 2>/dev/null || :
+            if sleep_pid=$(read_pid_marker "$pid_file"); then
+                kill -KILL "$sleep_pid" 2>/dev/null || :
+                wait "$sleep_pid" 2>/dev/null || :
+            fi
         fi
     done
     rm -rf -- "$TMP_DIR"
@@ -77,6 +105,8 @@ printf '%s\n' \
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "${FAKE_SLEEP_HOLD:-false}" = true ] && [ "${1:-}" != "0.01" ]; then' \
+    '    : >"${SLEEP_PID_FILE:?}"' \
+    '    /bin/sleep 0.05' \
     '    printf "%s\\n" "$$" >"${SLEEP_PID_FILE:?}"' \
     '    exec /bin/sleep 60' \
     'fi' \
@@ -175,14 +205,13 @@ run_wait_lifecycle_case() {
 
     sleep_pid=''
     for attempt in $(seq 1 "$lifecycle_poll_attempts"); do
-        if [ -f "$pid_file" ]; then
-            sleep_pid=$(<"$pid_file")
+        if [ -s "$pid_file" ] && sleep_pid=$(read_pid_marker "$pid_file"); then
             break
         fi
         /bin/sleep 0.01
     done
     if [ -z "$sleep_pid" ]; then
-        fail "$label wait did not start the held sleep"
+        fail "$label wait did not publish a valid held sleep PID"
         return 1
     fi
     kill -TERM "$WAIT_LIFECYCLE_PID"
