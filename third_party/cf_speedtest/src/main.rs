@@ -474,10 +474,17 @@ fn upload_once(
 ) -> std::result::Result<TransferSample, AttemptFailure> {
     let started_at = Instant::now();
     let url = format!("{}/__up?measId={meas_id}", base_url.trim_end_matches('/'));
-    let body = vec![1u8; requested_bytes];
+    let uploaded_counter = Arc::new(AtomicUsize::new(0));
+    let body = ureq::SendBody::from_owned_reader(UploadHelper {
+        bytes_to_send: requested_bytes,
+        byte_ctr: Arc::new(AtomicUsize::new(0)),
+        total_uploaded_counter: Arc::clone(&uploaded_counter),
+        exit_signal: Arc::new(AtomicBool::new(false)),
+    });
     let mut response = agent
         .post(url)
         .header("Content-Type", "text/plain;charset=UTF-8")
+        .header("Content-Length", requested_bytes.to_string())
         .config()
         .http_status_as_error(false)
         .build()
@@ -504,7 +511,15 @@ fn upload_once(
     std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
         .map_err(|_| AttemptFailure::Transport)?;
 
-    Ok(transfer_sample(requested_bytes, started_at))
+    let uploaded_bytes = uploaded_counter.load(Ordering::SeqCst);
+    if uploaded_bytes != requested_bytes {
+        return Err(AttemptFailure::InvalidBodyLength {
+            expected: requested_bytes,
+            actual: uploaded_bytes,
+        });
+    }
+
+    Ok(transfer_sample(uploaded_bytes, started_at))
 }
 
 fn execute_with_retry<F, S>(
