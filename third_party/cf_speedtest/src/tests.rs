@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1140,4 +1140,237 @@ fn retry_after_deadline_is_shared_by_two_logical_workers_in_virtual_time() {
     assert_eq!(second_worker_issue_time, second_worker_start);
     assert!(second_worker_issue_time >= retry_deadline_ms);
     assert_eq!(sleep_log, vec![750]);
+}
+
+#[test]
+fn requested_direction_maps_cli_switches_to_the_single_production_direction() {
+    let mut args = UserArgs::default();
+    assert_eq!(Direction::from_args(&args), Direction::Both);
+
+    args.download_only = true;
+    assert_eq!(Direction::from_args(&args), Direction::Download);
+
+    args.download_only = false;
+    args.upload_only = true;
+    assert_eq!(Direction::from_args(&args), Direction::Upload);
+}
+
+#[test]
+fn server_info_uses_a_fresh_nonzero_measurement_id_and_propagates_runtime_failure() {
+    let agent = local_http_agent();
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(200, b"server-info", None)
+    });
+    let result = get_download_server_info(&agent, &server.base_url);
+    let requests = server.finish();
+
+    assert!(result.is_ok());
+    assert_eq!(requests.len(), 1);
+    let meas_id = requests[0].query_value("measId").expect("server-info measId");
+    assert!(!meas_id.is_empty());
+    assert_ne!(meas_id, "0");
+    assert!(meas_id.bytes().all(|byte| byte.is_ascii_digit()));
+
+    let failing_server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(503, b"failure", None)
+    });
+    let failure = get_download_server_info(&agent, &failing_server.base_url);
+    let _ = failing_server.finish();
+    assert!(failure.is_err(), "server-info runtime failures must propagate");
+}
+
+#[test]
+fn attempt_failure_messages_distinguish_exhausted_429_and_non_429_causes() {
+    let result = execute_with_retry(
+        RetryPolicy::default(),
+        |_meas_id| Err(AttemptFailure::RateLimited(None)),
+        |_delay_secs| {},
+    );
+    let rate_limited = result
+        .expect_err("three rate-limited attempts must terminate")
+        .to_string()
+        .to_ascii_lowercase();
+    let status = AttemptFailure::HttpStatus(503).to_string();
+    let transport = AttemptFailure::Transport.to_string();
+    let body = AttemptFailure::InvalidBodyLength {
+        expected: 8,
+        actual: 7,
+    }
+    .to_string();
+
+    assert!(rate_limited.contains("429"));
+    assert!(rate_limited.contains("retry budget exhausted"));
+    assert!(status.contains("503"));
+    assert!(status.to_ascii_lowercase().contains("http"));
+    assert!(transport.to_ascii_lowercase().contains("transport"));
+    assert!(body.contains("expected 8"));
+    assert!(body.contains("actual 7"));
+}
+
+fn test_timestamp(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+#[test]
+fn timestamped_logger_keeps_concurrent_multiline_calls_as_whole_blocks() {
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let logger = Arc::new(ThreadSafeLogger::new(Arc::clone(&output)));
+    let barrier = Arc::new(Barrier::new(3));
+    let timestamp_a = test_timestamp("2026-09-12T01:02:03.456Z");
+    let timestamp_b = test_timestamp("2026-09-12T01:02:04.456Z");
+    let message_a = "下载: 8.00 mb/s\n┌────────────┐\n│ 上传 │ 8.00 mb/s │\n└────────────┘\n";
+    let message_b = "worker-b\n┌────┐\n│ B  │\n└────┘\n";
+    let expected_a = format_timestamped_lines(timestamp_a, message_a);
+    let expected_b = format_timestamped_lines(timestamp_b, message_b);
+
+    let handles: Vec<_> = [(timestamp_a, message_a), (timestamp_b, message_b)]
+        .into_iter()
+        .map(|(timestamp, message)| {
+            let logger = Arc::clone(&logger);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                logger.log_at(timestamp, message).unwrap();
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        rendered == format!("{expected_a}{expected_b}")
+            || rendered == format!("{expected_b}{expected_a}"),
+        "concurrent log calls must not interleave physical lines: {rendered:?}"
+    );
+}
+
+#[test]
+fn direction_runner_attempts_positive_cycles_but_zero_cycles_record_no_sample() {
+    let gate = RuntimeRequestGate::new();
+    let now_ms = Cell::new(0_u64);
+    let empty_state = DirectionState::default();
+    let zero_result = run_direction_for_cycles(
+        Direction::Download,
+        0,
+        &empty_state,
+        &gate,
+        |_| panic!("zero cycles must not issue a request"),
+        || now_ms.get(),
+        |delay_ms| now_ms.set(now_ms.get().saturating_add(delay_ms)),
+    );
+    assert_eq!(zero_result, DirectionRunResult::NoValidSamples);
+    assert_eq!(empty_state.snapshot().valid_sample_count, 0);
+
+    let positive_state = DirectionState::default();
+    let positive_result = run_direction_for_cycles(
+        Direction::Download,
+        1,
+        &positive_state,
+        &gate,
+        |attempt_id| {
+            assert_ne!(attempt_id, 0);
+            Ok(TransferSample {
+                bytes: 16,
+                bytes_per_second: 160,
+            })
+        },
+        || now_ms.get(),
+        |delay_ms| now_ms.set(now_ms.get().saturating_add(delay_ms)),
+    );
+    assert_eq!(positive_result, DirectionRunResult::SuccessTable);
+    assert_eq!(positive_state.snapshot().valid_sample_count, 1);
+}
+
+fn test_output_text(output: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8(output.lock().unwrap().clone()).unwrap()
+}
+
+fn test_logger() -> (Arc<Mutex<Vec<u8>>>, ThreadSafeLogger<Vec<u8>>) {
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let logger = ThreadSafeLogger::new(Arc::clone(&output));
+    (output, logger)
+}
+
+fn sampled_snapshot(bytes: usize, bytes_per_second: usize) -> DirectionStateSnapshot {
+    let state = DirectionState::default();
+    state.record_sample(TransferSample {
+        bytes,
+        bytes_per_second,
+    });
+    state.snapshot()
+}
+
+#[test]
+fn run_program_renders_a_table_only_for_complete_requested_directions() {
+    let args = UserArgs::default();
+    let download_snapshot = sampled_snapshot(8, 80);
+    let upload_snapshot = sampled_snapshot(9, 90);
+    let (output, logger) = test_logger();
+
+    let exit_code = run_program(&args, &download_snapshot, &upload_snapshot, &logger);
+
+    assert_eq!(exit_code, 0);
+    let rendered = test_output_text(&output);
+    assert!(rendered.contains("Median"));
+    assert!(rendered.contains("90th pctile"));
+}
+
+#[test]
+fn run_program_returns_semantic_failure_codes_without_rendering_a_success_table() {
+    let empty_download = DirectionState::default();
+    let empty_upload = DirectionState::default();
+    let empty_download_snapshot = empty_download.snapshot();
+    let empty_upload_snapshot = empty_upload.snapshot();
+    let mut args = UserArgs::default();
+    let (zero_output, zero_logger) = test_logger();
+
+    let zero_code = run_program(
+        &args,
+        &empty_download_snapshot,
+        &empty_upload_snapshot,
+        &zero_logger,
+    );
+    assert_eq!(zero_code, 3);
+    assert!(!test_output_text(&zero_output).contains("90th pctile"));
+
+    let terminal_download = DirectionState::default();
+    terminal_download.record_sample(TransferSample {
+        bytes: 4,
+        bytes_per_second: 40,
+    });
+    terminal_download.record_terminal_error(AttemptFailure::HttpStatus(503));
+    let terminal_snapshot = terminal_download.snapshot();
+    args.download_only = true;
+    let (terminal_output, terminal_logger) = test_logger();
+
+    let terminal_code = run_program(
+        &args,
+        &terminal_snapshot,
+        &empty_upload_snapshot,
+        &terminal_logger,
+    );
+    assert_eq!(terminal_code, 1);
+    let rendered = test_output_text(&terminal_output);
+    assert!(rendered.contains("503"));
+    assert!(!rendered.contains("90th pctile"));
+}
+
+#[test]
+fn run_program_rejects_invalid_thread_or_byte_arguments_with_exit_two() {
+    let download = DirectionState::default().snapshot();
+    let upload = DirectionState::default().snapshot();
+    let (output, logger) = test_logger();
+    let mut args = UserArgs::default();
+    args.download_threads = 0;
+    assert_eq!(run_program(&args, &download, &upload, &logger), 2);
+
+    args = UserArgs::default();
+    args.bytes_to_upload = 0;
+    assert_eq!(run_program(&args, &download, &upload, &logger), 2);
+    assert!(!test_output_text(&output).contains("90th pctile"));
 }
