@@ -614,6 +614,23 @@ notice_contract() {
     require_line "$file" '不重新授权继承的基础镜像层' 'NOTICE inherited-layer non-relicensing' || return 1
 }
 
+provenance_contract() {
+    python3 - "$ROOT/third_party/cf_speedtest/UPSTREAM.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+assert data.get("receipt_scope") == "pre-change upstream bytes", data.get("receipt_scope")
+assert data.get("locally_modified_files") == [
+    "src/args.rs",
+    "src/main.rs",
+    "src/tests.rs",
+], data.get("locally_modified_files")
+PY
+}
+
 run_group 'test fixture portability' portability_contract
 run_group 'runtime logger behavior' bash "$ROOT/tests/test_runtime_log.sh"
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
@@ -625,6 +642,7 @@ run_group 'Dockerfile static contract' dockerfile_contract
 run_group 'Compose static contract' compose_contract
 run_group 'README static contract' documentation_contract
 run_group 'NOTICE static contract' notice_contract
+run_group 'cf_speedtest provenance contract' provenance_contract
 
 if [ "$failures" -ne 0 ]; then
     printf '%s test groups failed\n' "$failures" >&2
