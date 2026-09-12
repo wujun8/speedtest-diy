@@ -1,0 +1,1181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd -P)
+RUNTIME="$REPO_ROOT/network-runtime.sh"
+
+if [[ ! -f "$RUNTIME" ]]; then
+  printf 'FAIL: network-runtime.sh is missing (RED: helper has not been implemented)\n' >&2
+  exit 1
+fi
+
+STATE=$(mktemp -d "${TMPDIR:-/tmp}/network-runtime-test.XXXXXX")
+FAKE_BIN="$STATE/bin"
+RUNTIME_TMP="$STATE/tmp"
+mkdir -p "$FAKE_BIN" "$RUNTIME_TMP"
+
+cleanup() {
+  local marker worker_pid
+  if [[ -n ${LIFECYCLE_PID:-} ]]; then
+    kill -KILL "$LIFECYCLE_PID" 2>/dev/null || :
+  fi
+  for marker in "$STATE"/worker-pid.*; do
+    if [[ -f "$marker" ]]; then
+      worker_pid=$(<"$marker")
+      kill -KILL "$worker_pid" 2>/dev/null || :
+    fi
+  done
+  for marker in "$STATE"/registration-child-pid.* "$STATE"/race-curl-pid "$STATE"/race-worker-pid; do
+    if [[ -f "$marker" ]]; then
+      worker_pid=$(<"$marker")
+      kill -KILL "$worker_pid" 2>/dev/null || :
+    fi
+  done
+  rm -rf "$STATE"
+}
+trap cleanup EXIT HUP INT TERM
+
+cat > "$FAKE_BIN/curl" <<'FAKE_CURL'
+#!/usr/bin/env bash
+set -u
+
+: "${FAKE_STATE:?FAKE_STATE is required}"
+log="$FAKE_STATE/curl.calls"
+env_log="$FAKE_STATE/curl.env"
+options_log="$FAKE_STATE/curl.options"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+printf 'first=%s noproxy_name=%s noproxy_value=%s\n' "${1-}" "${2-}" "${3-}" >> "$options_log"
+contract_error=''
+if [[ ${1-} != '--disable' ]]; then
+  contract_error+=" first_option=${1-}"
+fi
+if [[ ${2-} != '--noproxy' || ${3-} != '*' ]]; then
+  contract_error+=" noproxy_args=${2-},${3-}"
+fi
+if (( proxy_env_present != 0 )); then
+  contract_error+=' ambient_proxy_env_present'
+fi
+if [[ -n "$contract_error" ]]; then
+  printf 'fake curl contract violation:%s\n' "$contract_error" >&2
+  exit 94
+fi
+output=''
+range=''
+header_file=''
+write_out=''
+previous=''
+silent=false
+show_error=false
+url_after_boundary=false
+url=''
+for arg in "$@"; do
+  if [[ "$url_after_boundary" == true ]]; then
+    url=$arg
+    url_after_boundary=false
+    previous=''
+    continue
+  fi
+  if [[ "$previous" == '--output' || "$previous" == '-o' ]]; then
+    output=$arg
+  elif [[ "$previous" == '--range' || "$previous" == '-r' ]]; then
+    range=$arg
+  elif [[ "$previous" == '--dump-header' || "$previous" == '-D' ]]; then
+    header_file=$arg
+  elif [[ "$previous" == '--write-out' || "$previous" == '-w' ]]; then
+    write_out=$arg
+  fi
+  case "$arg" in
+    --) url_after_boundary=true; previous='' ;;
+    --silent|-s) silent=true; previous='' ;;
+    --show-error|-S) show_error=true; previous='' ;;
+    --output|-o) previous="$arg" ;;
+    --range|-r) previous="$arg" ;;
+    --dump-header|-D) previous="$arg" ;;
+    --write-out|-w) previous="$arg" ;;
+    --output=*) output=${arg#*=}; previous='' ;;
+    --range=*) range=${arg#*=}; previous='' ;;
+    --dump-header=*) header_file=${arg#*=}; previous='' ;;
+    --write-out=*) write_out=${arg#*=}; previous='' ;;
+    *) previous='' ;;
+  esac
+done
+
+kind='full'
+start=''
+end=''
+if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+  kind='range'
+  start=${BASH_REMATCH[1]}
+  end=${BASH_REMATCH[2]}
+fi
+
+via=${FAKE_VIA_PROXY:-0}
+dir_mode=$(stat -c '%a' -- "$(dirname "$header_file")" 2>/dev/null || printf 'missing')
+printf 'pid=%s kind=%s start=%s end=%s output=%s via=%s header=%s write=%s args=%s dir_mode=%s ppid=%s\n' \
+  "$$" "$kind" "$start" "$end" "$output" "$via" "$header_file" "$write_out" "$*" "$dir_mode" "$PPID" >> "$log"
+
+if [[ "$output" != '/dev/null' ]]; then
+  printf 'fake curl refused non-/dev/null output\n' >&2
+  exit 90
+fi
+if [[ -z "$header_file" || -z "$write_out" ]]; then
+  printf 'fake curl requires --dump-header and --write-out metadata\n' >&2
+  exit 91
+fi
+if [[ "$silent" != true || "$show_error" != true ]]; then
+  printf 'fake curl requires --silent and --show-error\n' >&2
+  exit 92
+fi
+if [[ "${FAKE_REQUIRE_URL_BOUNDARY:-false}" == 'true' && -z "$url" ]]; then
+  printf 'fake curl requires an explicit -- before the URL\n' >&2
+  exit 93
+fi
+
+if [[ "${FAKE_RACE_CURL:-false}" == 'true' ]]; then
+  if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
+    line=''
+    term_count=0
+    trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-curl"' TERM INT
+    printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
+    while :; do
+      IFS= read -r -t 0.05 line < /dev/zero || :
+    done
+  fi
+  printf '%s\n' "$$" > "$FAKE_STATE/race-curl-pid"
+  exec sleep 60
+fi
+
+total=${FAKE_TOTAL:-101}
+mode=${FAKE_WGET_MODE:-normal}
+status=200
+response_start=''
+response_end=''
+downloaded=$total
+
+if [[ "$kind" == 'range' ]]; then
+  status=206
+  response_start=$start
+  response_end=$end
+  downloaded=$((end - start + 1))
+  if [[ "$mode" == 'unsupported' && "$start" == '0' && "$end" == '0' ]]; then
+    status=200
+    response_start=''
+    response_end=''
+    downloaded=$total
+  elif [[ "$mode" == 'malformed' && "$start" == '0' && "$end" == '0' ]]; then
+    response_start=0
+    response_end=1
+    downloaded=2
+  fi
+fi
+
+if [[ "$kind" == 'range' && "$start" != '0' && "${FAKE_BARRIER:-false}" == 'true' ]]; then
+  marker="$FAKE_STATE/started.${start}-${end}"
+  if (set -C; : > "$marker") 2>/dev/null; then
+    :
+  fi
+  count=0
+  for attempt in $(seq 1 400); do
+    count=0
+    for candidate in "$FAKE_STATE"/started.*; do
+      if [[ -e "$candidate" ]]; then
+        count=$((count + 1))
+      fi
+    done
+    if (( count >= ${FAKE_EXPECT_SEGMENTS:-1} )); then
+      break
+    fi
+    sleep 0.01
+done
+  if (( count < ${FAKE_EXPECT_SEGMENTS:-1} )); then
+    printf 'barrier_failed start=%s end=%s count=%s\n' "$start" "$end" "$count" >> "$FAKE_STATE/barrier.calls"
+    exit 88
+  fi
+  printf 'barrier_released start=%s end=%s\n' "$start" "$end" >> "$FAKE_STATE/barrier.calls"
+fi
+
+if [[ "$kind" == 'range' && "$start" != '0' ]]; then
+  if [[ "$mode" == 'bad_range' && "${FAKE_BAD_RANGE:-}" == "$start-$end" ]]; then
+    response_end=$((end - 1))
+    downloaded=$((response_end - start + 1))
+  elif [[ "$mode" == 'bad_size' && "${FAKE_BAD_RANGE:-}" == "$start-$end" ]]; then
+    downloaded=$((downloaded - 1))
+  elif [[ "$mode" == 'bad_status' && "${FAKE_BAD_RANGE:-}" == "$start-$end" ]]; then
+    status=200
+  fi
+fi
+
+: > "$header_file"
+printf 'HTTP/1.1 %s\n' "$status" >> "$header_file"
+if [[ -n "$response_start" ]]; then
+  printf 'Content-Range: bytes %s-%s/%s\n' \
+    "$response_start" "$response_end" "$total" >> "$header_file"
+fi
+printf '\n' >> "$header_file"
+printf '%s\t%s\n' "$status" "$downloaded"
+
+if [[ "$kind" == 'range' && "$start" != '0' && "${FAKE_HOLD_WORKERS:-false}" == 'true' ]]; then
+  printf '%s\n' "$$" > "$FAKE_STATE/worker-pid.$start-$end"
+  trap ':' TERM INT
+  while [[ ! -e "$FAKE_STATE/release-workers" ]]; do
+    sleep 0.05
+  done
+fi
+
+if [[ "$mode" == 'fail_range' && "$kind" == 'range' && "${FAKE_FAIL_RANGE:-}" == "$start-$end" ]]; then
+  printf 'fake curl worker failure start=%s end=%s\n' "$start" "$end" >&2
+  exit 17
+fi
+exit 0
+FAKE_CURL
+chmod +x "$FAKE_BIN/curl"
+
+cat > "$FAKE_BIN/wget" <<'FAKE_WGET'
+#!/usr/bin/env bash
+set -u
+: "${FAKE_STATE:?FAKE_STATE is required}"
+printf 'wget-called args=%s\n' "$*" >> "$FAKE_STATE/wget.calls"
+exit 99
+FAKE_WGET
+chmod +x "$FAKE_BIN/wget"
+
+cat > "$FAKE_BIN/proxychains4" <<'FAKE_PROXY'
+#!/usr/bin/env bash
+set -u
+
+: "${FAKE_STATE:?FAKE_STATE is required}"
+env_log="$FAKE_STATE/proxy.env"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+if (( proxy_env_present != 0 )); then
+  printf 'fake proxychains4 saw ambient proxy environment\n' >&2
+  exit 95
+fi
+printf 'pid=%s conf_set=%s conf_value=%s args=%s\n' \
+  "$$" "${PROXYCHAINS_CONF_FILE+x}" "${PROXYCHAINS_CONF_FILE-}" "$*" >> "$FAKE_STATE/proxy.calls"
+if [[ "${1:-}" == '-f' ]]; then
+  shift 2
+fi
+if [[ $# -eq 0 ]]; then
+  exit 64
+fi
+FAKE_VIA_PROXY=1
+export FAKE_VIA_PROXY
+exec "$@"
+FAKE_PROXY
+chmod +x "$FAKE_BIN/proxychains4"
+
+cat > "$FAKE_BIN/cf_speedtest" <<'FAKE_CF'
+#!/usr/bin/env bash
+set -u
+
+: "${FAKE_STATE:?FAKE_STATE is required}"
+env_log="$FAKE_STATE/cf.env"
+proxy_env_keys=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+proxy_env_present=0
+for key in "${proxy_env_keys[@]}"; do
+  if printenv "$key" >/dev/null 2>&1; then
+    printf 'present=%s\n' "$key" >> "$env_log"
+    proxy_env_present=1
+  else
+    printf 'absent=%s\n' "$key" >> "$env_log"
+  fi
+done
+if (( proxy_env_present != 0 )); then
+  printf 'fake cf_speedtest saw ambient proxy environment\n' >&2
+  exit 96
+fi
+printf 'pid=%s via=%s args=%s\n' "$$" "${FAKE_VIA_PROXY:-0}" "$*" >> "$FAKE_STATE/cf.calls"
+if [[ "${FAKE_CF_FAIL:-false}" == 'true' ]]; then
+  exit 19
+fi
+if [[ "${FAKE_CF_HOLD:-false}" == 'true' ]]; then
+  printf '%s\n' "$$" > "$FAKE_STATE/cf-pid"
+  trap ':' TERM INT
+  while [[ ! -e "$FAKE_STATE/release-cf" ]]; do
+    sleep 0.05
+  done
+fi
+exit 0
+FAKE_CF
+chmod +x "$FAKE_BIN/cf_speedtest"
+
+cat > "$FAKE_BIN/race-worker" <<'FAKE_RACE'
+#!/usr/bin/env bash
+set -u
+
+: "${FAKE_STATE:?FAKE_STATE is required}"
+if [[ "${FAKE_RACE_DEDUPE:-false}" == 'true' ]]; then
+  line=''
+  term_count=0
+  trap 'term_count=$((term_count + 1)); printf "%s\n" "$term_count" > "$FAKE_STATE/race-term-count-run"' TERM INT
+  printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
+  while :; do
+    IFS= read -r -t 0.05 line < /dev/zero || :
+  done
+fi
+printf '%s\n' "$$" > "$FAKE_STATE/race-worker-pid"
+exec sleep 60
+FAKE_RACE
+chmod +x "$FAKE_BIN/race-worker"
+
+export PATH="$FAKE_BIN:$PATH"
+export FAKE_STATE="$STATE"
+export TMPDIR="$RUNTIME_TMP"
+: > "$STATE/curl.calls"
+: > "$STATE/curl.env"
+: > "$STATE/curl.options"
+: > "$STATE/wget.calls"
+: > "$STATE/proxy.calls"
+: > "$STATE/proxy.env"
+: > "$STATE/cf.calls"
+: > "$STATE/cf.env"
+
+fail() {
+  printf 'FAIL: %s\n' "$1" >&2
+  exit 1
+}
+
+pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+assert_eq() {
+  local expected=$1
+  local actual=$2
+  local message=$3
+  [[ "$expected" == "$actual" ]] || fail "$message (expected [$expected], got [$actual])"
+}
+
+assert_contains() {
+  local haystack=$1
+  local needle=$2
+  local message=$3
+  [[ "$haystack" == *"$needle"* ]] || fail "$message (missing [$needle])"
+}
+
+assert_not_contains() {
+  local haystack=$1
+  local needle=$2
+  local message=$3
+  [[ "$haystack" != *"$needle"* ]] || fail "$message (unexpected [$needle])"
+}
+
+set_poison_proxy_env() {
+  HTTP_PROXY='poison-HTTP_PROXY'
+  HTTPS_PROXY='poison-HTTPS_PROXY'
+  ALL_PROXY='poison-ALL_PROXY'
+  NO_PROXY='poison-NO_PROXY'
+  http_proxy='poison-http_proxy'
+  https_proxy='poison-https_proxy'
+  all_proxy='poison-all_proxy'
+  no_proxy='poison-no_proxy'
+  export HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  export http_proxy https_proxy all_proxy no_proxy
+}
+
+assert_poison_proxy_env_preserved() {
+  assert_eq 'poison-HTTP_PROXY' "$HTTP_PROXY" 'caller HTTP_PROXY changed'
+  assert_eq 'poison-HTTPS_PROXY' "$HTTPS_PROXY" 'caller HTTPS_PROXY changed'
+  assert_eq 'poison-ALL_PROXY' "$ALL_PROXY" 'caller ALL_PROXY changed'
+  assert_eq 'poison-NO_PROXY' "$NO_PROXY" 'caller NO_PROXY changed'
+  assert_eq 'poison-http_proxy' "$http_proxy" 'caller http_proxy changed'
+  assert_eq 'poison-https_proxy' "$https_proxy" 'caller https_proxy changed'
+  assert_eq 'poison-all_proxy' "$all_proxy" 'caller all_proxy changed'
+  assert_eq 'poison-no_proxy' "$no_proxy" 'caller no_proxy changed'
+}
+
+assert_child_proxy_env_absent() {
+  local log=$1
+  local expected_calls=$2
+  local key
+  local bad
+
+  assert_eq "$((expected_calls * 8))" "$(count_lines "$log")" "child proxy-environment log count was wrong: $log"
+  bad=$(awk '$1 !~ /^absent=/' "$log")
+  [[ -z "$bad" ]] || fail "child saw an ambient proxy variable in $log: $bad"
+  for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    assert_eq "$expected_calls" \
+      "$(awk -v key="$key" '$1 == ("absent=" key) { n++ } END { print n + 0 }' "$log")" \
+      "child proxy-environment log missed $key in $log"
+  done
+}
+
+assert_curl_options() {
+  local expected_calls=$1
+  local bad
+
+  assert_eq "$expected_calls" "$(count_lines "$STATE/curl.options")" 'curl option log count was wrong'
+  bad=$(awk '$1 != "first=--disable" || $2 != "noproxy_name=--noproxy" || $3 != "noproxy_value=*" { print }' "$STATE/curl.options")
+  [[ -z "$bad" ]] || fail "curl option contract was wrong: $bad"
+}
+
+reset_fake_state() {
+  : > "$STATE/curl.calls"
+  : > "$STATE/curl.env"
+  : > "$STATE/curl.options"
+  : > "$STATE/wget.calls"
+  : > "$STATE/proxy.calls"
+  : > "$STATE/proxy.env"
+  : > "$STATE/cf.calls"
+  : > "$STATE/cf.env"
+  rm -f "$STATE"/started.* "$STATE"/worker-pid.* "$STATE"/barrier.calls "$STATE"/release-workers "$STATE"/trap-complete
+  rm -f "$STATE"/cf-pid "$STATE"/release-cf "$STATE"/cf-trap-complete
+  rm -f "$STATE"/registration-child-pid.* "$STATE"/registration-complete.* \
+    "$STATE"/race-curl-pid "$STATE"/race-worker-pid "$STATE"/race-term-count-*
+  unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS
+  unset FAKE_BAD_RANGE FAKE_FAIL_RANGE FAKE_CF_FAIL FAKE_CF_HOLD FAKE_REQUIRE_URL_BOUNDARY
+  unset FAKE_RACE_CURL FAKE_RACE_DEDUPE
+  unset FAKE_VIA_PROXY PROXYCHAINS_CONF_FILE
+}
+
+run_capture() {
+  local output_file=$1
+  local error_file=$2
+  shift 2
+  if "$@" >"$output_file" 2>"$error_file"; then
+    CALL_RC=0
+  else
+    CALL_RC=$?
+  fi
+}
+
+count_lines() {
+  local file=$1
+  if [[ ! -e "$file" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  awk 'END { print NR + 0 }' "$file"
+}
+
+registration_debug_probe() {
+  local command=$BASH_COMMAND
+  local should_signal=0
+
+  case "${REGISTRATION_TRIGGER:-}" in
+    run-after|curl-after)
+      [[ $command == 'pid=$!' ]] && should_signal=1
+      ;;
+    run-before)
+      [[ $command == *'$@'* ]] && should_signal=1
+      ;;
+    curl-before)
+      [[ $command == *'clear_proxy_env'* && $command == *curl* ]] && should_signal=1
+      ;;
+    run-dedupe)
+      [[ $command == 'wait "$pid"' || $command == '_NR_START_IN_PROGRESS=0' ]] && should_signal=1
+      ;;
+    curl-dedupe)
+      [[ $command == '_NR_LAST_PID=$pid' || $command == '_NR_START_IN_PROGRESS=0' ]] && should_signal=1
+      ;;
+  esac
+
+  if (( should_signal != 0 )); then
+    printf '%s\n' "${!:-}" > "${REGISTRATION_MARKER:?}"
+    trap - DEBUG
+    if [[ ${REGISTRATION_TRIGGER:-} == run-dedupe ]]; then
+      for attempt in $(seq 1 300); do
+        [[ -f "$FAKE_STATE/race-worker-pid" ]] && break
+        sleep 0.01
+      done
+    elif [[ ${REGISTRATION_TRIGGER:-} == curl-dedupe ]]; then
+      for attempt in $(seq 1 300); do
+        [[ -f "$FAKE_STATE/race-curl-pid" ]] && break
+        sleep 0.01
+      done
+    fi
+    kill -TERM "$BASHPID"
+  fi
+}
+
+wait_for_pid_stop() {
+  local pid=$1
+  local attempt state
+
+  for attempt in $(seq 1 300); do
+    if [[ ! -r "/proc/$pid/stat" ]]; then
+      return 0
+    fi
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    if [[ $state == Z ]]; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  kill -KILL "$pid" 2>/dev/null || :
+  wait "$pid" 2>/dev/null || :
+  fail "process did not exit within the bound: $pid"
+}
+
+assert_pid_stopped() {
+  local pid=$1
+  local state
+
+  if [[ -r "/proc/$pid/stat" ]]; then
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    [[ $state == Z ]] || fail "process is still live: $pid (state=$state)"
+  elif kill -0 "$pid" 2>/dev/null; then
+    fail "process is still live without a /proc state: $pid"
+  fi
+}
+
+assert_pid_live() {
+  local pid=$1
+  local state
+
+  kill -0 "$pid" 2>/dev/null || fail "process unexpectedly stopped: $pid"
+  if [[ -r "/proc/$pid/stat" ]]; then
+    state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || :)
+    [[ $state != Z ]] || fail "process is a zombie: $pid"
+  fi
+}
+
+stop_pid() {
+  local pid=$1
+  kill -TERM "$pid" 2>/dev/null || :
+  wait "$pid" 2>/dev/null || :
+}
+
+assert_all_curl_outputs_are_dev_null() {
+  local bad
+  bad=$(awk '$5 != "output=/dev/null" { print }' "$STATE/curl.calls")
+  [[ -z "$bad" ]] || fail "a curl invocation did not write /dev/null: $bad"
+}
+
+assert_all_curl_calls_have_metadata() {
+  local bad
+  bad=$(awk '$7 == "header=" || $8 == "write=" { print }' "$STATE/curl.calls")
+  [[ -z "$bad" ]] || fail "a curl invocation lacked header/write-out metadata: $bad"
+}
+
+assert_no_worktree_response_files() {
+  local candidate
+  for candidate in "$REPO_ROOT"/response* "$REPO_ROOT"/download*; do
+    if [[ -e "$candidate" ]]; then
+      fail "response artifact appeared in worktree: $candidate"
+    fi
+  done
+}
+
+assert_no_runtime_temp_dirs() {
+  local candidate
+  for candidate in "$RUNTIME_TMP"/network-runtime.*; do
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      fail "runtime metadata directory was not removed: $candidate"
+    fi
+  done
+}
+
+# Source must be inert, preserve caller shell options, and contain no wget path.
+opts_before=$(set +o)
+source "$RUNTIME"
+opts_after=$(set +o)
+assert_eq "$opts_before" "$opts_after" 'sourcing helper changed caller shell options'
+assert_eq '0' "$(count_lines "$STATE/curl.calls")" 'source performed a curl call'
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'source performed a wget call'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'source performed a proxychains call'
+assert_eq '0' "$(count_lines "$STATE/cf.calls")" 'source performed a cf_speedtest call'
+runtime_text=$(<"$RUNTIME")
+assert_not_contains "$runtime_text" 'wget' 'production helper still references wget'
+pass 'source is inert, preserves shell options, and is curl-only'
+
+# Configuration validation: defaults, normalization, accepted modes, and rejects.
+unset DOWNLOAD_THREADS SPEEDTEST_DOWNLOAD_ONLY PROXY_CONFIG
+validate_network_runtime_config
+assert_eq '4' "$DOWNLOAD_THREADS" 'unset DOWNLOAD_THREADS did not default to 4'
+assert_eq 'false' "$SPEEDTEST_DOWNLOAD_ONLY" 'unset SPEEDTEST_DOWNLOAD_ONLY did not default to false'
+DOWNLOAD_THREADS=004
+SPEEDTEST_DOWNLOAD_ONLY=true
+validate_network_runtime_config
+assert_eq '4' "$DOWNLOAD_THREADS" 'leading-zero DOWNLOAD_THREADS was not normalized'
+assert_eq 'true' "$SPEEDTEST_DOWNLOAD_ONLY" 'true download-only mode was not accepted'
+SPEEDTEST_DOWNLOAD_ONLY=false
+validate_network_runtime_config
+assert_eq 'false' "$SPEEDTEST_DOWNLOAD_ONLY" 'false download-only mode was not accepted'
+pass 'configuration defaults, normalization, and accepted values'
+
+for invalid_threads in 0 00 65 999 abc 4.0 +4 ''; do
+  reset_fake_state
+  if (DOWNLOAD_THREADS="$invalid_threads"; SPEEDTEST_DOWNLOAD_ONLY=false; run_url_download 'http://example.test/file') \
+      >"$STATE/invalid-thread.out" 2>"$STATE/invalid-thread.err"; then
+    fail "invalid DOWNLOAD_THREADS [$invalid_threads] was accepted"
+  fi
+  assert_eq '0' "$(count_lines "$STATE/curl.calls")" "invalid DOWNLOAD_THREADS [$invalid_threads] invoked curl"
+  assert_eq '0' "$(count_lines "$STATE/wget.calls")" "invalid DOWNLOAD_THREADS [$invalid_threads] invoked wget"
+done
+pass 'invalid DOWNLOAD_THREADS values fail before network calls'
+
+for invalid_mode in TRUE False 1 0 yes ''; do
+  reset_fake_state
+  if (DOWNLOAD_THREADS=4; SPEEDTEST_DOWNLOAD_ONLY="$invalid_mode"; run_cf_speedtest_direct) \
+      >"$STATE/invalid-mode.out" 2>"$STATE/invalid-mode.err"; then
+    fail "invalid SPEEDTEST_DOWNLOAD_ONLY [$invalid_mode] was accepted"
+  fi
+  assert_eq '0' "$(count_lines "$STATE/cf.calls")" "invalid mode [$invalid_mode] invoked cf_speedtest"
+done
+pass 'invalid SPEEDTEST_DOWNLOAD_ONLY values fail before speed tests'
+
+# Ambient proxy variables must be absent from every network child, while the
+# caller keeps its original values. Fake curl also asserts the curl options.
+set_poison_proxy_env
+
+reset_fake_state
+export FAKE_TOTAL=101
+unset PROXY_CONFIG
+DOWNLOAD_THREADS=1
+run_capture "$STATE/env-direct-url.out" "$STATE/env-direct-url.err" run_url_download 'http://example.test/file'
+if (( CALL_RC != 0 )); then
+  fail "direct URL proxy isolation/options failed: $(<"$STATE/env-direct-url.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'direct URL isolation test made the wrong number of curl calls'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct URL isolation test used proxychains4'
+assert_child_proxy_env_absent "$STATE/curl.env" 1
+assert_curl_options 1
+assert_poison_proxy_env_preserved
+pass 'direct URL clears all ambient proxy variables and disables curlrc'
+
+reset_fake_state
+export FAKE_TOTAL=101
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+DOWNLOAD_THREADS=1
+run_capture "$STATE/env-proxy-url.out" "$STATE/env-proxy-url.err" run_url_download 'http://example.test/file'
+if (( CALL_RC != 0 )); then
+  fail "proxy URL proxy isolation/options failed: $(<"$STATE/env-proxy-url.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'proxy URL isolation test made the wrong number of curl calls'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy URL isolation test did not use proxychains4'
+assert_child_proxy_env_absent "$STATE/curl.env" 1
+assert_child_proxy_env_absent "$STATE/proxy.env" 1
+assert_curl_options 1
+assert_poison_proxy_env_preserved
+pass 'proxy URL clears all ambient proxy variables before proxychains4'
+
+reset_fake_state
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/env-direct-cf.out" "$STATE/env-direct-cf.err" run_cf_speedtest_direct --alpha beta
+if (( CALL_RC != 0 )); then
+  fail "direct cf_speedtest proxy isolation failed: $(<"$STATE/env-direct-cf.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'direct cf isolation test made the wrong number of calls'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct cf isolation test used proxychains4'
+assert_child_proxy_env_absent "$STATE/cf.env" 1
+assert_poison_proxy_env_preserved
+pass 'direct cf_speedtest clears all ambient proxy variables'
+
+reset_fake_state
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/env-proxy-cf.out" "$STATE/env-proxy-cf.err" run_cf_speedtest_proxy --alpha beta
+if (( CALL_RC != 0 )); then
+  fail "proxy cf_speedtest proxy isolation failed: $(<"$STATE/env-proxy-cf.err")"
+fi
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'proxy cf isolation test made the wrong number of calls'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy cf isolation test did not use proxychains4'
+assert_child_proxy_env_absent "$STATE/proxy.env" 1
+assert_child_proxy_env_absent "$STATE/cf.env" 1
+assert_poison_proxy_env_preserved
+pass 'proxy cf_speedtest clears all ambient proxy variables before proxychains4'
+
+# Direct URL download: one probe plus four concurrent, exact contiguous ranges.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_BARRIER=true FAKE_EXPECT_SEGMENTS=4
+unset PROXY_CONFIG
+DOWNLOAD_THREADS=4
+SPEEDTEST_DOWNLOAD_ONLY=false
+caller_umask_before=$(umask)
+run_capture "$STATE/direct.out" "$STATE/direct.err" run_url_download 'http://example.test/file'
+caller_umask_after=$(umask)
+assert_eq '0' "$CALL_RC" 'direct segmented download failed'
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'direct segmented download did not make probe + 4 requests'
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'direct segmented download invoked wget'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct segmented download used proxychains4'
+assert_eq '0' "$(awk '$6 != "via=0" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'direct segmented curl was not direct'
+assert_eq '1' "$(awk '$2 == "kind=range" && $3 == "start=0" && $4 == "end=0" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'probe range was not exactly bytes 0-0'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'segmented mode issued a complete download'
+assert_eq $'1-25\n26-50\n51-75\n76-100' "$(awk '$2 == "kind=range" && $3 != "start=0" { sub("start=", "", $3); sub("end=", "", $4); print $3 "-" $4 }' "$STATE/curl.calls" | sort)" 'segment ranges were not exact'
+awk '
+  $2 == "kind=range" {
+    sub("start=", "", $3); sub("end=", "", $4)
+    for (i = ($3 + 0); i <= ($4 + 0); i++) seen[i]++
+  }
+  END {
+    for (i = 0; i <= 100; i++) if (seen[i] != 1) exit 1
+    for (i = 101; i <= 200; i++) if (seen[i]) exit 1
+  }
+' "$STATE/curl.calls" || fail 'probe + segments did not cover exactly bytes 0..100'
+assert_eq '4' "$(count_lines "$STATE/barrier.calls" | awk '{ print $1 }')" 'four segment workers did not reach the barrier'
+assert_not_contains "$(<"$STATE/barrier.calls")" 'barrier_failed' 'segment workers were not concurrent'
+assert_contains "$(<"$STATE/direct.out")" 'total bytes=101' 'direct summary omitted total bytes'
+assert_contains "$(<"$STATE/direct.out")" 'concurrent segments=4' 'direct summary omitted effective segment count'
+assert_contains "$(<"$STATE/direct.out")" 'transport=direct' 'direct summary omitted transport'
+assert_all_curl_outputs_are_dev_null
+assert_all_curl_calls_have_metadata
+assert_no_worktree_response_files
+pass 'direct segmented download has exact coverage and real concurrency'
+
+# Proxy URL download: probe and every segment must pass through proxychains4.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_BARRIER=true FAKE_EXPECT_SEGMENTS=4
+PROXY_CONFIG='socks5 127.0.0.1 9100'
+DOWNLOAD_THREADS=4
+run_capture "$STATE/proxy-url.out" "$STATE/proxy-url.err" run_url_download 'http://example.test/file'
+assert_eq '0' "$CALL_RC" 'proxy segmented download failed'
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'proxy segmented download did not make probe + 4 requests'
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'proxy segmented download invoked wget'
+assert_eq '5' "$(count_lines "$STATE/proxy.calls")" 'proxy segmented download did not wrap every curl'
+assert_eq '0' "$(awk '$6 != "via=1" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'a proxy-mode curl was not run via proxychains4'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'proxy segmented mode issued a complete download'
+assert_not_contains "$(<"$STATE/proxy.calls")" 'conf_set=x' 'proxy wrapper received PROXYCHAINS_CONF_FILE'
+assert_not_contains "$(<"$STATE/proxy.calls")" "$PROXY_CONFIG" 'proxy content was treated as a config-file path'
+assert_not_contains "$(<"$STATE/proxy.calls")" 'args=-f' 'proxy wrapper received a config-file flag'
+assert_contains "$(<"$STATE/proxy.calls")" 'args=curl ' 'proxy wrapper did not receive curl as its command'
+assert_contains "$(<"$STATE/proxy-url.out")" 'transport=proxy' 'proxy summary omitted transport'
+assert_all_curl_outputs_are_dev_null
+assert_all_curl_calls_have_metadata
+assert_eq '5' "$(awk '$7 ~ /\/network-runtime\.[^/]+\// { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'curl metadata did not stay inside a private runtime directory'
+assert_eq '0' "$(awk '$(NF - 1) != "dir_mode=700" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'runtime metadata directory was not private'
+assert_eq "$caller_umask_before" "$caller_umask_after" 'runtime directory creation changed caller umask'
+assert_no_runtime_temp_dirs
+assert_no_worktree_response_files
+pass 'proxy segmented download wraps probe and all segments'
+
+# DOWNLOAD_THREADS=1: exactly one complete request and no probe/range header.
+reset_fake_state
+unset PROXY_CONFIG
+export FAKE_TOTAL=101
+DOWNLOAD_THREADS=1
+run_capture "$STATE/one.out" "$STATE/one.err" run_url_download 'http://example.test/file'
+assert_eq '0' "$CALL_RC" 'single-thread download failed'
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'single-thread download did not issue exactly one curl'
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'single-thread download invoked wget'
+assert_eq '1' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'single-thread download was not complete'
+assert_eq '0' "$(awk '$2 == "kind=range" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'single-thread download issued a Range probe'
+assert_contains "$(<"$STATE/one.out")" 'concurrent segments=1' 'single-thread summary omitted effective segment count'
+assert_all_curl_outputs_are_dev_null
+assert_all_curl_calls_have_metadata
+pass 'single-thread download is one complete /dev/null request'
+
+# Every curl request must end its option list before an arbitrary URL argument.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_REQUIRE_URL_BOUNDARY=true
+DOWNLOAD_THREADS=1
+unset PROXY_CONFIG
+run_capture "$STATE/url-boundary.out" "$STATE/url-boundary.err" run_url_download '--url-that-starts-with-a-dash'
+assert_eq '0' "$CALL_RC" 'URL option boundary download failed'
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'URL option boundary issued the wrong number of curl calls'
+assert_contains "$(<"$STATE/url-boundary.out")" 'total bytes=101' 'URL option boundary omitted the complete-download summary'
+pass 'curl terminates options before the URL argument'
+
+# Range unsupported, malformed probe, and total <= 1 are fail-closed.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=unsupported
+DOWNLOAD_THREADS=4
+unset PROXY_CONFIG
+if run_url_download 'http://example.test/file' >"$STATE/unsupported.out" 2>"$STATE/unsupported.err"; then
+  fail 'unsupported Range response was accepted'
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'unsupported Range did not stop after probe'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'unsupported Range triggered a complete download'
+
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=malformed
+if run_url_download 'http://example.test/file' >"$STATE/malformed.out" 2>"$STATE/malformed.err"; then
+  fail 'malformed Content-Range response was accepted'
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'malformed probe did not fail before segments'
+
+reset_fake_state
+export FAKE_TOTAL=1 FAKE_WGET_MODE=normal
+if run_url_download 'http://example.test/file' >"$STATE/short.out" 2>"$STATE/short.err"; then
+  fail 'total <= 1 was accepted for segmented mode'
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'total <= 1 did not fail after probe'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'total <= 1 triggered a complete download'
+pass 'unsupported, malformed, and short responses fail closed'
+
+reset_fake_state
+export FAKE_TOTAL=9223372036854775808 FAKE_WGET_MODE=normal
+if run_url_download 'http://example.test/file' >"$STATE/huge-total.out" 2>"$STATE/huge-total.err"; then
+  fail 'signed-max-overflow total was accepted'
+fi
+assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'oversized total did not stop after the probe'
+assert_eq '0' "$(awk '$2 == "kind=range" && $3 != "start=0" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'oversized total started segment workers'
+assert_no_runtime_temp_dirs
+pass 'oversized remote totals fail closed before segment arithmetic'
+
+# A worker command failure and final status/size/Content-Range mismatches fail overall.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=fail_range FAKE_FAIL_RANGE=51-75
+if run_url_download 'http://example.test/file' >"$STATE/fail-worker.out" 2>"$STATE/fail-worker.err"; then
+  fail 'segment command failure was accepted'
+fi
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'segment command failure did not harvest all workers'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'segment command failure triggered a complete download'
+
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=bad_range FAKE_BAD_RANGE=26-50
+if run_url_download 'http://example.test/file' >"$STATE/bad-range.out" 2>"$STATE/bad-range.err"; then
+  fail 'segment Content-Range mismatch was accepted'
+fi
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'Content-Range mismatch did not harvest all workers'
+
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=bad_size FAKE_BAD_RANGE=26-50
+if run_url_download 'http://example.test/file' >"$STATE/bad-size.out" 2>"$STATE/bad-size.err"; then
+  fail 'segment size_download mismatch was accepted'
+fi
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'size_download mismatch did not harvest all workers'
+
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_WGET_MODE=bad_status FAKE_BAD_RANGE=26-50
+if run_url_download 'http://example.test/file' >"$STATE/bad-status.out" 2>"$STATE/bad-status.err"; then
+  fail 'segment HTTP status mismatch was accepted'
+fi
+assert_eq '5' "$(count_lines "$STATE/curl.calls")" 'status mismatch did not harvest all workers'
+assert_eq '0' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'response mismatches triggered a complete download'
+pass 'worker failures and response status/size/range mismatches fail overall'
+
+# Deterministic RED/GREEN coverage for the async PID-registration window.
+reset_fake_state
+unset PROXY_CONFIG
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=run-after
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-after"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-after-trap\\n" > "$FAKE_STATE/registration-complete.run-after"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-after.out" 2>"$STATE/run-after.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked registration-window trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail 'run_tracked registration-window trap did not capture the just-started PID'
+[[ -f "$STATE/registration-complete.run-after" ]] || fail 'run_tracked registration-window trap did not complete cleanup'
+assert_eq '1' "$(count_lines "$STATE/registration-complete.run-after")" 'run_tracked registration-window trap completed more than once'
+registered_pid=$(<"$REGISTRATION_MARKER")
+[[ "$registered_pid" != "$unrelated_pid" ]] || fail 'run_tracked registration-window captured the prior unrelated PID'
+assert_pid_stopped "$registered_pid"
+assert_pid_live "$unrelated_pid"
+stop_pid "$unrelated_pid"
+pass 'run_tracked closes the deterministic post-launch registration window'
+
+reset_fake_state
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=run-before
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-before"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-before-trap\\n" > "$FAKE_STATE/registration-complete.run-before"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-before.out" 2>"$STATE/run-before.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked pre-launch trap did not exit with 143'
+assert_eq "$unrelated_pid" "$(<"$REGISTRATION_MARKER")" 'run_tracked pre-launch signal did not observe the prior PID'
+assert_pid_live "$unrelated_pid"
+assert_eq '0' "$(count_lines "$STATE/race-worker-pid")" 'run_tracked launched a worker after the pre-launch signal'
+stop_pid "$unrelated_pid"
+pass 'run_tracked pre-launch cleanup preserves the prior unrelated PID'
+
+reset_fake_state
+unset PROXY_CONFIG
+export FAKE_RACE_CURL=true
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=curl-after
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-after"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-after-trap\\n" > "$FAKE_STATE/registration-complete.curl-after"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-after.out" 2>"$STATE/curl-after.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl registration-window trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail '_nr_start_curl registration-window trap did not capture the just-started PID'
+registered_pid=$(<"$REGISTRATION_MARKER")
+[[ "$registered_pid" != "$unrelated_pid" ]] || fail '_nr_start_curl registration-window captured the prior unrelated PID'
+assert_pid_stopped "$registered_pid"
+assert_pid_live "$unrelated_pid"
+stop_pid "$unrelated_pid"
+pass '_nr_start_curl closes the deterministic post-launch registration window'
+
+reset_fake_state
+sleep 60 &
+unrelated_pid=$!
+REGISTRATION_TRIGGER=curl-before
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-before"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-before-trap\\n" > "$FAKE_STATE/registration-complete.curl-before"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-before.out" 2>"$STATE/curl-before.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl pre-launch trap did not exit with 143'
+assert_eq "$unrelated_pid" "$(<"$REGISTRATION_MARKER")" '_nr_start_curl pre-launch signal did not observe the prior PID'
+assert_pid_live "$unrelated_pid"
+assert_eq '0' "$(count_lines "$STATE/curl.calls")" '_nr_start_curl launched curl after the pre-launch signal'
+stop_pid "$unrelated_pid"
+pass '_nr_start_curl pre-launch cleanup preserves the prior unrelated PID'
+
+reset_fake_state
+export FAKE_RACE_DEDUPE=true
+REGISTRATION_TRIGGER=run-dedupe
+REGISTRATION_MARKER="$STATE/registration-child-pid.run-dedupe"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "run-dedupe-trap\\n" > "$FAKE_STATE/registration-complete.run-dedupe"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_run_tracked "$FAKE_BIN/race-worker"
+) >"$STATE/run-dedupe.out" 2>"$STATE/run-dedupe.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" 'run_tracked post-append trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail 'run_tracked post-append trap did not capture the PID'
+assert_pid_stopped "$(<"$REGISTRATION_MARKER")"
+[[ -f "$STATE/race-term-count-run" ]] || fail 'run_tracked post-append trap did not reach the fake child TERM handler'
+assert_eq '1' "$(<"$STATE/race-term-count-run")" 'run_tracked sent duplicate TERM signals to a registered PID'
+pass 'run_tracked deduplicates a PID already appended before start-state clear'
+
+reset_fake_state
+export FAKE_RACE_CURL=true FAKE_RACE_DEDUPE=true
+REGISTRATION_TRIGGER=curl-dedupe
+REGISTRATION_MARKER="$STATE/registration-child-pid.curl-dedupe"
+(
+  source "$RUNTIME"
+  set -T
+  trap 'cancel_network_runtime; printf "curl-dedupe-trap\\n" > "$FAKE_STATE/registration-complete.curl-dedupe"; exit 143' TERM INT
+  trap registration_debug_probe DEBUG
+  _nr_start_curl "$STATE/race-curl.headers" "$STATE/race-curl.metadata" 'http://example.test/file' ''
+) >"$STATE/curl-dedupe.out" 2>"$STATE/curl-dedupe.err" &
+window_pid=$!
+wait_for_pid_stop "$window_pid"
+window_rc=0
+wait "$window_pid" || window_rc=$?
+assert_eq '143' "$window_rc" '_nr_start_curl post-append trap did not exit with 143'
+[[ -s "$REGISTRATION_MARKER" ]] || fail '_nr_start_curl post-append trap did not capture the PID'
+assert_pid_stopped "$(<"$REGISTRATION_MARKER")"
+[[ -f "$STATE/race-term-count-curl" ]] || fail '_nr_start_curl post-append trap did not reach the fake child TERM handler'
+assert_eq '1' "$(<"$STATE/race-term-count-curl")" '_nr_start_curl sent duplicate TERM signals to a registered PID'
+pass '_nr_start_curl deduplicates a PID already appended before start-state clear'
+
+# Caller-owned TERM cleanup must terminate and reap every held worker and remove the private directory.
+reset_fake_state
+export FAKE_TOTAL=101 FAKE_BARRIER=true FAKE_EXPECT_SEGMENTS=4 FAKE_HOLD_WORKERS=true
+unset PROXY_CONFIG
+DOWNLOAD_THREADS=4
+caller_umask_before=$(umask)
+(
+  source "$RUNTIME"
+  trap 'cancel_network_runtime; printf "trap-complete\n" > "$FAKE_STATE/trap-complete"; exit 143' TERM INT
+  run_url_download 'http://example.test/file'
+) >"$STATE/lifecycle.out" 2>"$STATE/lifecycle.err" &
+LIFECYCLE_PID=$!
+
+worker_count=0
+for attempt in $(seq 1 300); do
+  worker_count=0
+  for marker in "$STATE"/worker-pid.*; do
+    if [[ -f "$marker" ]]; then
+      worker_count=$((worker_count + 1))
+    fi
+  done
+  if (( worker_count == 4 )); then
+    break
+  fi
+  sleep 0.01
+done
+assert_eq '4' "$worker_count" 'lifecycle test did not start four held curl workers'
+assert_eq '0' "$(awk -v parent="$LIFECYCLE_PID" '$2 == "kind=range" && $3 != "start=0" { p = $NF; sub(/^ppid=/, "", p); if (p != parent) bad++ } END { print bad + 0 }' "$STATE/curl.calls")" 'held curl workers were not direct children of the lifecycle shell'
+runtime_dir=$(awk 'NR == 1 { sub(/^header=/, "", $7); sub(/\/[^/]+$/, "", $7); print $7; exit }' "$STATE/curl.calls")
+[[ -n "$runtime_dir" && -d "$runtime_dir" ]] || fail 'lifecycle runtime directory was not created'
+assert_eq '700' "$(stat -c '%a' -- "$runtime_dir")" 'lifecycle runtime directory was not private'
+
+kill -TERM "$LIFECYCLE_PID"
+lifecycle_live=1
+for attempt in $(seq 1 300); do
+  if [[ ! -e "/proc/$LIFECYCLE_PID/stat" ]] || [[ $(awk '{ print $3 }' "/proc/$LIFECYCLE_PID/stat" 2>/dev/null) == Z ]]; then
+    lifecycle_live=0
+    break
+  fi
+  sleep 0.01
+done
+if (( lifecycle_live != 0 )); then
+  kill -KILL "$LIFECYCLE_PID" 2>/dev/null || :
+  wait "$LIFECYCLE_PID" 2>/dev/null || :
+  fail 'TERM cleanup did not exit within the bound'
+fi
+lifecycle_rc=0
+wait "$LIFECYCLE_PID" || lifecycle_rc=$?
+assert_eq '143' "$lifecycle_rc" 'caller TERM trap did not complete through cancel_network_runtime'
+assert_eq '1' "$(count_lines "$STATE/trap-complete")" 'caller TERM trap did not return from cancel_network_runtime'
+caller_umask_after=$(umask)
+assert_eq "$caller_umask_before" "$caller_umask_after" 'lifecycle cleanup changed caller umask'
+for marker in "$STATE"/worker-pid.*; do
+  [[ -f "$marker" ]] || continue
+  worker_pid=$(<"$marker")
+  worker_live=1
+  for attempt in $(seq 1 100); do
+    if ! kill -0 "$worker_pid" 2>/dev/null; then
+      worker_live=0
+      break
+    fi
+    sleep 0.01
+  done
+  (( worker_live == 0 )) || fail "held curl worker still exists: $worker_pid"
+done
+[[ ! -e "$runtime_dir" ]] || fail 'TERM cleanup left the runtime metadata directory'
+assert_no_runtime_temp_dirs
+pass 'caller TERM cleanup terminates, reaps, and removes all segment resources'
+
+# TERM cleanup must also terminate and reap an in-flight direct cf_speedtest.
+reset_fake_state
+export FAKE_CF_HOLD=true PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+(
+  source "$RUNTIME"
+  trap 'cancel_network_runtime; printf "cf-trap-complete\n" > "$FAKE_STATE/cf-trap-complete"; exit 143' TERM INT
+  run_cf_speedtest_direct --alpha beta
+) >"$STATE/cf-lifecycle.out" 2>"$STATE/cf-lifecycle.err" &
+LIFECYCLE_PID=$!
+
+cf_pid=''
+for attempt in $(seq 1 300); do
+  if [[ -f "$STATE/cf-pid" ]]; then
+    cf_pid=$(<"$STATE/cf-pid")
+    break
+  fi
+  sleep 0.01
+done
+[[ -n "$cf_pid" ]] || fail 'cf_speedtest lifecycle test did not start the held process'
+kill -TERM "$LIFECYCLE_PID"
+lifecycle_live=1
+for attempt in $(seq 1 300); do
+  if [[ ! -e "/proc/$LIFECYCLE_PID/stat" ]] || [[ $(awk '{ print $3 }' "/proc/$LIFECYCLE_PID/stat" 2>/dev/null) == Z ]]; then
+    lifecycle_live=0
+    break
+  fi
+  sleep 0.01
+done
+if (( lifecycle_live != 0 )); then
+  kill -KILL "$LIFECYCLE_PID" 2>/dev/null || :
+  wait "$LIFECYCLE_PID" 2>/dev/null || :
+  fail 'cf_speedtest TERM cleanup did not exit within the bound'
+fi
+lifecycle_rc=0
+wait "$LIFECYCLE_PID" || lifecycle_rc=$?
+assert_eq '143' "$lifecycle_rc" 'cf_speedtest TERM trap did not complete'
+assert_eq '1' "$(count_lines "$STATE/cf-trap-complete")" 'cf_speedtest TERM trap did not return from cleanup'
+cf_live=0
+if [[ -e "/proc/$cf_pid/stat" ]] && [[ $(awk '{ print $3 }' "/proc/$cf_pid/stat" 2>/dev/null) != Z ]]; then
+  cf_live=1
+fi
+assert_eq '0' "$cf_live" 'in-flight cf_speedtest still exists after TERM cleanup'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'explicit direct cf_speedtest used proxychains4'
+assert_contains "$(<"$STATE/cf.calls")" 'via=0' 'explicit direct cf_speedtest was not direct'
+pass 'TERM cleanup terminates and reaps in-flight direct cf_speedtest'
+
+# Empty URL skips without any command invocation.
+reset_fake_state
+export FAKE_TOTAL=101
+unset PROXY_CONFIG
+DOWNLOAD_THREADS=4
+run_capture "$STATE/empty.out" "$STATE/empty.err" run_url_download ''
+assert_eq '0' "$CALL_RC" 'empty URL was not skipped successfully'
+assert_eq '0' "$(count_lines "$STATE/curl.calls")" 'empty URL invoked curl'
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'empty URL invoked wget'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'empty URL invoked proxychains4'
+assert_contains "$(<"$STATE/empty.out")" 'skipped' 'empty URL did not emit an English skip log'
+pass 'empty URL skips with zero network calls'
+
+# Speed tests: direct both/down-only; direct never uses proxychains4.
+reset_fake_state
+unset PROXY_CONFIG
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/cf-direct-both.out" "$STATE/cf-direct-both.err" run_cf_speedtest_direct --alpha beta
+assert_eq '0' "$CALL_RC" 'direct both-direction cf_speedtest failed'
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'direct both-direction cf_speedtest call count wrong'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct cf_speedtest used proxychains4'
+assert_contains "$(<"$STATE/cf.calls")" '--alpha beta' 'direct cf_speedtest did not preserve arguments'
+assert_not_contains "$(<"$STATE/cf.calls")" '--download-only' 'both-direction cf_speedtest unexpectedly used download-only'
+
+reset_fake_state
+export PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=true
+run_capture "$STATE/cf-direct-down.out" "$STATE/cf-direct-down.err" run_cf_speedtest_direct --alpha beta
+assert_eq '0' "$CALL_RC" 'direct download-only cf_speedtest failed'
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'direct download-only cf_speedtest call count wrong'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct download-only cf_speedtest used proxychains4'
+assert_contains "$(<"$STATE/cf.calls")" '--download-only --alpha beta' 'direct download-only flag/arguments were wrong'
+pass 'direct cf_speedtest preserves args and optional download-only mode'
+
+# Proxy speed tests: configured uses proxychains; empty config warns and skips.
+reset_fake_state
+export PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=true
+run_capture "$STATE/cf-proxy-down.out" "$STATE/cf-proxy-down.err" run_cf_speedtest_proxy --gamma delta
+assert_eq '0' "$CALL_RC" 'proxy download-only cf_speedtest failed'
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'proxy cf_speedtest call count wrong'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy cf_speedtest did not use proxychains4'
+assert_contains "$(<"$STATE/cf.calls")" 'via=1' 'proxy cf_speedtest was not proxied'
+assert_contains "$(<"$STATE/cf.calls")" '--download-only --gamma delta' 'proxy download-only flag/arguments were wrong'
+assert_not_contains "$(<"$STATE/proxy.calls")" 'conf_set=x' 'proxy speedtest received PROXYCHAINS_CONF_FILE'
+assert_not_contains "$(<"$STATE/proxy.calls")" "$PROXY_CONFIG" 'proxy speedtest treated content as a config-file path'
+assert_not_contains "$(<"$STATE/proxy.calls")" 'args=-f' 'proxy speedtest received a config-file flag'
+assert_contains "$(<"$STATE/proxy.calls")" 'args=cf_speedtest ' 'proxy speedtest wrapper did not receive cf_speedtest as its command'
+
+reset_fake_state
+unset PROXY_CONFIG
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/cf-proxy-skip.out" "$STATE/cf-proxy-skip.err" run_cf_speedtest_proxy --gamma delta
+assert_eq '0' "$CALL_RC" 'empty proxy config did not skip successfully'
+assert_eq '0' "$(count_lines "$STATE/cf.calls")" 'empty proxy config called cf_speedtest'
+assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'empty proxy config called proxychains4'
+assert_contains "$(<"$STATE/cf-proxy-skip.err")" 'WARNING: proxy speed test skipped' 'proxy skip warning was not clear English'
+pass 'proxy cf_speedtest uses configured proxy or skips safely when absent'
+
+assert_no_worktree_response_files
+assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'test run made a wget call'
+printf 'All network-runtime tests passed.\n'

@@ -46,14 +46,20 @@ cat >"$SYNTHETIC_FIXTURE" <<'EOF'
 #!/bin/bash
 
 : "${WAIT_TIME:=21600}"
+: "${PROXY_CONFIG:=socks5 127.0.0.1 9100}"
 : "${TEST_DURATION:=10}"
 : "${DOWNLOAD_THREADS:=4}"
 : "${UPLOAD_THREADS:=4}"
+: "${SPEEDTEST_DOWNLOAD_ONLY:=false}"
+: "${RUN_SPEEDTEST_DIRECT:=true}"
+: "${RUN_SPEEDTEST_PROXY:=true}"
+: "${URL_DDL:=}"
 
 # Gestion des signaux d'arrêt
 trap "echo -e '\e[1;31mArrêt du script demandé. Nettoyage et sortie...\e[0m'; exit 0" SIGTERM SIGINT
 
 # Définir les couleurs avec tput
+printf "strict_chain\nquiet_mode\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n[ProxyList]\n%s\n" "$PROXY_CONFIG" > /etc/proxychains4.conf
 RED=$(tput setaf 1)
 GREEN=$(tput setaf 2)
 YELLOW=$(tput setaf 3)
@@ -109,11 +115,18 @@ EOF
 chmod 755 "$SYNTHETIC_FIXTURE"
 
 OLD_WAIT_DEFAULT=': "${WAIT_TIME:=21600}"'
+OLD_PROXY_DEFAULT=': "${PROXY_CONFIG:=socks5 127.0.0.1 9100}"'
+OLD_PROXY_CONFIG='printf "strict_chain\nquiet_mode\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n[ProxyList]\n%s\n" "$PROXY_CONFIG" > /etc/proxychains4.conf'
 OLD_COLORS_LINE='# Définir les couleurs avec tput'
 OLD_INITIAL_SLEEP='sleep 5'
 OLD_DIRECT_SPEEDTEST='        if ! cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 OLD_PROXY_SPEEDTEST='        if ! proxychains4 cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
 OLD_URL_DDL='        proxychains4 wget -O /dev/null --progress=dot:giga --no-check-certificate "$URL_DDL" 2>&1 | awk '\''/saved/ {print $0}'\'''
+OLD_DIRECT_COMMAND="$OLD_DIRECT_SPEEDTEST"
+OLD_PROXY_COMMAND="$OLD_PROXY_SPEEDTEST"
+OLD_URL_COMMAND="$OLD_URL_DDL"
+OLD_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=true}"'
+OLD_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=true}"'
 OLD_WAIT_MESSAGE='    echo -e "${CYAN}${BOLD}Attente de $((WAIT_TIME / 3600)) heures avant de relancer les tests...${RESET}"'
 OLD_WAIT_SLEEP='    sleep "$WAIT_TIME" &'
 OLD_WAIT_WAIT='    wait -n'
@@ -133,24 +146,33 @@ OLD_SIGNAL="trap \"echo -e '\\e[1;31m${OLD_SIGNAL_TEXT}\\e[0m'; exit 0\" SIGTERM
 OLD_SIGNAL_LINE=$OLD_SIGNAL
 OLD_DOWNLOAD_START_LINE="        echo -e \"\\n\${BLUE}\${BOLD}${OLD_DOWNLOAD_START_TEXT}\${RESET}\\n\""
 OLD_EMPTY_URL_LINE="        echo -e \"\\n\${YELLOW}\${BOLD}${OLD_EMPTY_URL_TEXT}\${RESET}\\n\""
-NEW_SIGNAL="trap \"echo -e '\\e[1;31mStop requested. Cleaning up and exiting...\\e[0m'; exit 0\" SIGTERM SIGINT"
-NEW_DIRECT_START='        echo -e "${GREEN}${BOLD}Starting direct speed test... ($((TEST_DURATION * 2)) sec)${RESET}"'
+NEW_SIGNAL='trap "cancel_network_runtime; echo '\''Stop requested. Cleaning up and exiting...'\''; exit 0" SIGTERM SIGINT'
 NEW_DIRECT_ERROR='            echo -e "${RED}${BOLD}Error: direct speed test failed${RESET}"'
 NEW_DIRECT_DISABLED='        echo -e "${YELLOW}${BOLD}Direct speed test disabled.${RESET}"'
-NEW_PROXY_START='        echo -e "${BLUE}${BOLD}Starting speed test through proxychains4... ($((TEST_DURATION * 2)) sec)${RESET}"'
 NEW_PROXY_ERROR='            echo -e "${RED}${BOLD}Error: proxy speed test failed${RESET}"'
 NEW_PROXY_DISABLED='        echo -e "${YELLOW}${BOLD}Proxy speed test disabled.${RESET}"'
-NEW_DOWNLOAD_START='        echo -e "\n${BLUE}${BOLD}Starting download from: $URL_DDL${RESET}\n"'
-NEW_EMPTY_URL='        echo -e "\n${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}\n"'
+NEW_DIRECT_DOWNLOAD_ONLY='Starting direct speed test (download-only, ${TEST_DURATION} sec)'
+NEW_DIRECT_BOTH='Starting direct speed test (download and upload, ${TEST_DURATION} sec per direction)'
+NEW_PROXY_DOWNLOAD_ONLY='Starting speed test through proxychains4 (download-only, ${TEST_DURATION} sec)'
+NEW_PROXY_BOTH='Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec per direction)'
+NEW_DOWNLOAD_START='        echo -e "${BLUE}${BOLD}Starting URL download...${RESET}"'
+NEW_EMPTY_URL='        echo -e "${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}"'
+NEW_DIRECT_COMMAND='        if ! run_cf_speedtest_direct --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
+NEW_PROXY_COMMAND='        if ! run_cf_speedtest_proxy --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
+NEW_URL_COMMAND='        if ! run_url_download "$URL_DDL"; then'
+NEW_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=false}"'
+NEW_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=false}"'
 NEW_INITIAL='echo -e "${CYAN}${BOLD}Starting in 5 seconds...${RESET}"'
 
 assert_translated_messages() {
     local file=$1 label=$2 forbidden
     assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label English signal log" || return 1
-    assert_line_exactly_once "$file" "$NEW_DIRECT_START" "$label English direct-start log" || return 1
+    assert_contains_file "$file" "$NEW_DIRECT_DOWNLOAD_ONLY" "$label direct download-only log" || return 1
+    assert_contains_file "$file" "$NEW_DIRECT_BOTH" "$label direct download-and-upload log" || return 1
     assert_line_exactly_once "$file" "$NEW_DIRECT_ERROR" "$label English direct-error log" || return 1
     assert_line_exactly_once "$file" "$NEW_DIRECT_DISABLED" "$label English direct-disabled log" || return 1
-    assert_line_exactly_once "$file" "$NEW_PROXY_START" "$label English proxy-start log" || return 1
+    assert_contains_file "$file" "$NEW_PROXY_DOWNLOAD_ONLY" "$label proxy download-only log" || return 1
+    assert_contains_file "$file" "$NEW_PROXY_BOTH" "$label proxy download-and-upload log" || return 1
     assert_line_exactly_once "$file" "$NEW_PROXY_ERROR" "$label English proxy-error log" || return 1
     assert_line_exactly_once "$file" "$NEW_PROXY_DISABLED" "$label English proxy-disabled log" || return 1
     assert_line_exactly_once "$file" "$NEW_DOWNLOAD_START" "$label English download-start log" || return 1
@@ -170,6 +192,38 @@ assert_translated_messages() {
         'Attente de'; do
         assert_not_contains_file "$file" "$forbidden" "$label French user-visible log" || return 1
     done
+}
+
+assert_generated_runtime_anchors() {
+    local file=$1 label=$2 config_guard_line direct_function_line proxy_function_line download_function_line
+    assert_line_exactly_once "$file" '. /usr/local/bin/random-wait.sh' "$label random helper source count" || return 1
+    assert_line_exactly_once "$file" '. /usr/local/bin/network-runtime.sh' "$label network helper source count" || return 1
+    assert_line_exactly_once "$file" 'if ! validate_wait_config; then' "$label wait preflight count" || return 1
+    assert_line_exactly_once "$file" 'if ! validate_network_runtime_config; then' "$label network preflight count" || return 1
+    assert_line_exactly_once "$file" 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$label config conditional count" || return 1
+    assert_line_exactly_once "$file" '    if ! (' "$label config write failure guard" || return 1
+    assert_line_exactly_once "$file" '        umask 077 &&' "$label private config umask" || return 1
+    assert_line_exactly_once "$file" '        printf "strict_chain\nquiet_mode\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n[ProxyList]\n%s\n" "$PROXY_CONFIG" > /etc/proxychains4.conf &&' "$label literal config write guard" || return 1
+    assert_line_exactly_once "$file" '            chmod 0600 -- /etc/proxychains4.conf' "$label config mode count" || return 1
+    assert_line_exactly_once "$file" '    ); then' "$label config failure branch" || return 1
+    assert_line_exactly_once "$file" "        printf '%s\\n' 'Error: failed to write proxy configuration.' >&2" "$label config failure diagnostic" || return 1
+    config_guard_line=$(grep -nF -- 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$file" | cut -d: -f1)
+    direct_function_line=$(grep -nF -- 'run_speedtest_direct() {' "$file" | cut -d: -f1)
+    proxy_function_line=$(grep -nF -- 'run_speedtest_proxy() {' "$file" | cut -d: -f1)
+    download_function_line=$(grep -nF -- 'run_ddl() {' "$file" | cut -d: -f1)
+    if [ -z "$config_guard_line" ] || [ -z "$direct_function_line" ] ||
+        [ -z "$proxy_function_line" ] || [ -z "$download_function_line" ] ||
+        [ "$config_guard_line" -ge "$direct_function_line" ] ||
+        [ "$config_guard_line" -ge "$proxy_function_line" ] ||
+        [ "$config_guard_line" -ge "$download_function_line" ]; then
+        fail "$label proxy config failure gate is not before speedtest/download code"
+        return 1
+    fi
+    assert_line_exactly_once "$file" 'wait_for_initial_start' "$label initial wait helper count" || return 1
+    assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label signal trap count" || return 1
+    assert_line_exactly_once "$file" "$NEW_DIRECT_COMMAND" "$label direct helper command count" || return 1
+    assert_line_exactly_once "$file" "$NEW_PROXY_COMMAND" "$label proxy helper command count" || return 1
+    assert_line_exactly_once "$file" "$NEW_URL_COMMAND" "$label URL helper command count" || return 1
 }
 
 make_comment_anchor_fixture() {
@@ -207,6 +261,23 @@ make_missing_anchor_fixture() {
     chmod 755 "$dest"
 }
 
+make_duplicate_anchor_fixture() {
+    local source=$1 dest=$2 old=$3 line count=0
+    : >"$dest"
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line" >>"$dest"
+        if [ "$line" = "$old" ]; then
+            printf '%s\n' "$line" >>"$dest"
+            count=$((count + 1))
+        fi
+    done <"$source"
+    if [ "$count" -ne 1 ]; then
+        fail "could not duplicate exactly one anchor in $dest (got $count)"
+        return 1
+    fi
+    chmod 755 "$dest"
+}
+
 assert_replacement_count_rejection() {
     local label=$1 fixture=$2 fixture_sha before_copy output
     before_copy=$TMP_DIR/$label.before
@@ -228,10 +299,14 @@ assert_replacement_count_rejection() {
 }
 
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_DEFAULT" 'synthetic WAIT_TIME default' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_DEFAULT" 'synthetic PROXY_CONFIG default' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_CONFIG" 'synthetic proxy config writer' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_COLORS_LINE" 'synthetic color anchor' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_INITIAL_SLEEP" 'synthetic initial delay' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_DIRECT_SPEEDTEST" 'synthetic direct speedtest' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_SPEEDTEST" 'synthetic proxy speedtest' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" 'synthetic direct toggle default' || exit 1
+assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_PROXY_TOGGLE_DEFAULT" 'synthetic proxy toggle default' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_URL_DDL" 'synthetic URL_DDL download' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_MESSAGE" 'synthetic wait message' || exit 1
 assert_line_exactly_once "$SYNTHETIC_FIXTURE" "$OLD_WAIT_SLEEP" 'synthetic wait sleep' || exit 1
@@ -263,21 +338,47 @@ if [ "$(stat -c '%a' "$TARGET")" != 755 ]; then
 fi
 assert_contains_file "$TARGET" 'RANDOM_WAIT_PATCH_MARKER' 'patched marker' || exit 1
 assert_contains_file "$TARGET" '. /usr/local/bin/random-wait.sh' 'random helper source' || exit 1
+assert_contains_file "$TARGET" '. /usr/local/bin/network-runtime.sh' 'network helper source' || exit 1
 assert_contains_file "$TARGET" 'if ! validate_wait_config; then' 'preflight validation' || exit 1
+assert_contains_file "$TARGET" 'if ! validate_network_runtime_config; then' 'network preflight validation' || exit 1
 assert_contains_file "$TARGET" ': "${WAIT_TIME:=}"' 'legacy default removal' || exit 1
+assert_line_exactly_once "$TARGET" ': "${PROXY_CONFIG:=}"' 'empty proxy default' || exit 1
+assert_line_exactly_once "$TARGET" "$NEW_DIRECT_TOGGLE_DEFAULT" 'direct speedtest disabled default' || exit 1
+assert_line_exactly_once "$TARGET" "$NEW_PROXY_TOGGLE_DEFAULT" 'proxy speedtest disabled default' || exit 1
+assert_not_contains_file "$TARGET" "$OLD_DIRECT_TOGGLE_DEFAULT" 'upstream direct speedtest default removal' || exit 1
+assert_not_contains_file "$TARGET" "$OLD_PROXY_TOGGLE_DEFAULT" 'upstream proxy speedtest default removal' || exit 1
+assert_not_contains_file "$TARGET" ': "${PROXY_CONFIG:=socks5 127.0.0.1 9100}"' 'localhost proxy default removal' || exit 1
+assert_contains_file "$TARGET" 'if [[ -n ${PROXY_CONFIG:-} ]]; then' 'conditional proxy config writer' || exit 1
+assert_contains_file "$TARGET" 'chmod 0600 -- /etc/proxychains4.conf' 'private proxy config mode' || exit 1
+assert_contains_file "$TARGET" 'strict_chain\nquiet_mode\nproxy_dns' 'strict proxy config body' || exit 1
+assert_contains_file "$TARGET" 'cancel_network_runtime' 'signal runtime cleanup' || exit 1
 if grep -Fq -- ': "${WAIT_TIME:=21600}"' "$TARGET"; then
     fail "upstream fixed WAIT_TIME default remains"
     exit 1
 fi
-assert_contains_file "$TARGET" 'sleep 5' 'fixed initial delay' || exit 1
+assert_contains_file "$TARGET" 'wait_for_initial_start' 'interruptible initial delay' || exit 1
 assert_contains_file "$TARGET" 'wait_for_next_run' 'random wait seam' || exit 1
 if grep -Fq -- 'sleep "$WAIT_TIME"' "$TARGET" || grep -Fq -- 'wait -n' "$TARGET"; then
     fail "old fixed wait loop remains"
     exit 1
 fi
-assert_contains_file "$TARGET" 'proxychains4 wget -O /dev/null --progress=dot:giga --no-check-certificate "$URL_DDL"' 'URL_DDL /dev/null behavior' || exit 1
-assert_contains_file "$TARGET" 'cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"' 'direct speedtest behavior' || exit 1
-assert_contains_file "$TARGET" 'proxychains4 cf_speedtest --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"' 'proxy speedtest behavior' || exit 1
+assert_contains_file "$TARGET" 'run_url_download "$URL_DDL"' 'URL_DDL runtime helper behavior' || exit 1
+assert_contains_file "$TARGET" 'run_cf_speedtest_direct --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"' 'direct speedtest runtime helper behavior' || exit 1
+assert_contains_file "$TARGET" 'run_cf_speedtest_proxy --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"' 'proxy speedtest runtime helper behavior' || exit 1
+assert_not_contains_file "$TARGET" 'proxychains4 wget' 'old URL wget command removal' || exit 1
+assert_not_contains_file "$TARGET" 'if ! cf_speedtest --test-duration-seconds' 'old direct command removal' || exit 1
+assert_not_contains_file "$TARGET" 'if ! proxychains4 cf_speedtest --test-duration-seconds' 'old proxy command removal' || exit 1
+assert_not_contains_file "$TARGET" 'Starting download from: $URL_DDL' 'URL redaction in start log' || exit 1
+assert_not_contains_file "$TARGET" 'TEST_DURATION * 2' 'false two-times duration wording' || exit 1
+if grep -nE '(^|[^[:alnum:]_])eval([[:space:]]|$)' "$TARGET"; then
+    fail "patched entrypoint contains eval"
+    exit 1
+fi
+if ! bash -n "$TARGET"; then
+    fail "patched synthetic entrypoint is not valid shell"
+    exit 1
+fi
+assert_generated_runtime_anchors "$TARGET" 'synthetic patched entrypoint' || exit 1
 assert_translated_messages "$TARGET" 'synthetic patched entrypoint' || exit 1
 
 if [ "$(grep -Fxc -- '# RANDOM_WAIT_PATCH_MARKER: validated random interval seam' "$TARGET")" != 1 ]; then
@@ -293,23 +394,49 @@ fi
 SIGNAL_COMMENT_FIXTURE=$TMP_DIR/signal-comment.sh
 DOWNLOAD_COMMENT_FIXTURE=$TMP_DIR/download-comment.sh
 EMPTY_COMMENT_FIXTURE=$TMP_DIR/empty-comment.sh
+PROXY_DEFAULT_COMMENT_FIXTURE=$TMP_DIR/proxy-default-comment.sh
+DIRECT_COMMAND_COMMENT_FIXTURE=$TMP_DIR/direct-command-comment.sh
+DIRECT_TOGGLE_COMMENT_FIXTURE=$TMP_DIR/direct-toggle-comment.sh
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_COMMENT_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_COMMENT_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
 make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_COMMENT_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$PROXY_DEFAULT_COMMENT_FIXTURE" "$OLD_PROXY_DEFAULT" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_COMMAND_COMMENT_FIXTURE" "$OLD_DIRECT_COMMAND" || exit 1
+make_comment_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_TOGGLE_COMMENT_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" || exit 1
 assert_replacement_count_rejection 'signal-comment' "$SIGNAL_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'download-comment' "$DOWNLOAD_COMMENT_FIXTURE" || exit 1
 assert_replacement_count_rejection 'empty-comment' "$EMPTY_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'proxy-default-comment' "$PROXY_DEFAULT_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-command-comment' "$DIRECT_COMMAND_COMMENT_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-toggle-comment' "$DIRECT_TOGGLE_COMMENT_FIXTURE" || exit 1
 
 # Removing each complete old shell line must fail closed without writing.
 SIGNAL_MISSING_FIXTURE=$TMP_DIR/signal-missing.sh
 DOWNLOAD_MISSING_FIXTURE=$TMP_DIR/download-missing.sh
 EMPTY_MISSING_FIXTURE=$TMP_DIR/empty-missing.sh
+PROXY_DEFAULT_MISSING_FIXTURE=$TMP_DIR/proxy-default-missing.sh
+DIRECT_COMMAND_MISSING_FIXTURE=$TMP_DIR/direct-command-missing.sh
+DIRECT_TOGGLE_MISSING_FIXTURE=$TMP_DIR/direct-toggle-missing.sh
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$SIGNAL_MISSING_FIXTURE" "$OLD_SIGNAL_LINE" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DOWNLOAD_MISSING_FIXTURE" "$OLD_DOWNLOAD_START_LINE" || exit 1
 make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$EMPTY_MISSING_FIXTURE" "$OLD_EMPTY_URL_LINE" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$PROXY_DEFAULT_MISSING_FIXTURE" "$OLD_PROXY_DEFAULT" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_COMMAND_MISSING_FIXTURE" "$OLD_DIRECT_COMMAND" || exit 1
+make_missing_anchor_fixture "$SYNTHETIC_FIXTURE" "$DIRECT_TOGGLE_MISSING_FIXTURE" "$OLD_DIRECT_TOGGLE_DEFAULT" || exit 1
 assert_replacement_count_rejection 'signal-missing' "$SIGNAL_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'download-missing' "$DOWNLOAD_MISSING_FIXTURE" || exit 1
 assert_replacement_count_rejection 'empty-missing' "$EMPTY_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'proxy-default-missing' "$PROXY_DEFAULT_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-command-missing' "$DIRECT_COMMAND_MISSING_FIXTURE" || exit 1
+assert_replacement_count_rejection 'direct-toggle-missing' "$DIRECT_TOGGLE_MISSING_FIXTURE" || exit 1
+
+# Duplicating a new exact anchor must also fail closed without writing.
+PROXY_CONFIG_DUPLICATE_FIXTURE=$TMP_DIR/proxy-config-duplicate.sh
+URL_COMMAND_DUPLICATE_FIXTURE=$TMP_DIR/url-command-duplicate.sh
+make_duplicate_anchor_fixture "$SYNTHETIC_FIXTURE" "$PROXY_CONFIG_DUPLICATE_FIXTURE" "$OLD_PROXY_CONFIG" || exit 1
+make_duplicate_anchor_fixture "$SYNTHETIC_FIXTURE" "$URL_COMMAND_DUPLICATE_FIXTURE" "$OLD_URL_COMMAND" || exit 1
+assert_replacement_count_rejection 'proxy-config-duplicate' "$PROXY_CONFIG_DUPLICATE_FIXTURE" || exit 1
+assert_replacement_count_rejection 'url-command-duplicate' "$URL_COMMAND_DUPLICATE_FIXTURE" || exit 1
 
 # Reject a changed synthetic entrypoint before any write and leave it byte-for-byte intact.
 BAD=$TMP_DIR/bad-entrypoint.sh
@@ -361,6 +488,19 @@ if [ "${UPSTREAM_ENTRYPOINT_FIXTURE+x}" = x ]; then
         fail "frozen fixture patched marker count is not exactly one"
         exit 1
     fi
+    assert_line_exactly_once "$REAL_TARGET" ': "${PROXY_CONFIG:=}"' 'frozen empty proxy default' || exit 1
+    assert_not_contains_file "$REAL_TARGET" ': "${PROXY_CONFIG:=socks5 127.0.0.1 9100}"' 'frozen localhost proxy default removal' || exit 1
+    assert_contains_file "$REAL_TARGET" '. /usr/local/bin/network-runtime.sh' 'frozen network helper source' || exit 1
+    assert_contains_file "$REAL_TARGET" 'if ! validate_network_runtime_config; then' 'frozen network preflight validation' || exit 1
+    assert_contains_file "$REAL_TARGET" 'cancel_network_runtime' 'frozen signal runtime cleanup' || exit 1
+    assert_contains_file "$REAL_TARGET" 'run_url_download "$URL_DDL"' 'frozen URL runtime helper' || exit 1
+    assert_not_contains_file "$REAL_TARGET" 'proxychains4 wget' 'frozen old URL wget removal' || exit 1
+    assert_not_contains_file "$REAL_TARGET" 'TEST_DURATION * 2' 'frozen false two-times duration wording' || exit 1
+    if ! bash -n "$REAL_TARGET"; then
+        fail "patched frozen entrypoint is not valid shell"
+        exit 1
+    fi
+    assert_generated_runtime_anchors "$REAL_TARGET" 'frozen patched entrypoint' || exit 1
     assert_translated_messages "$REAL_TARGET" 'frozen fixture patched entrypoint' || exit 1
 fi
 

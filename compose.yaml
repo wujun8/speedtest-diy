@@ -5,9 +5,13 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      URL_DDL: "${URL_DDL:-https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz}"
+      URL_DDL: "${URL_DDL-https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz}"
       WAIT_TIME_MIN: "${WAIT_TIME_MIN:-5}"
       WAIT_TIME_MAX: "${WAIT_TIME_MAX:-50}"
-      RUN_SPEEDTEST_DIRECT: "false"
-      RUN_SPEEDTEST_PROXY: "false"
-      PROXY_CONFIG: "${PROXY_CONFIG:-socks5 127.0.0.1 9100}"
+      TEST_DURATION: "${TEST_DURATION:-10}"
+      DOWNLOAD_THREADS: "${DOWNLOAD_THREADS:-4}"
+      UPLOAD_THREADS: "${UPLOAD_THREADS:-4}"
+      SPEEDTEST_DOWNLOAD_ONLY: "${SPEEDTEST_DOWNLOAD_ONLY:-false}"
+      RUN_SPEEDTEST_DIRECT: "${RUN_SPEEDTEST_DIRECT:-false}"
+      RUN_SPEEDTEST_PROXY: "${RUN_SPEEDTEST_PROXY:-false}"
+      PROXY_CONFIG: "${PROXY_CONFIG:-}"

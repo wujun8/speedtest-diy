@@ -19,7 +19,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
       - name: Shell syntax checks
-        run: bash -n random-wait.sh patch-entrypoint.sh tests/run.sh tests/test_random_wait.sh tests/test_patch_entrypoint.sh
+        run: bash -n random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh
       - name: Run TDD and static contract tests
         run: bash tests/run.sh
 
@@ -41,46 +41,245 @@ jobs:
           docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$IMAGE" -c '
             set -eu
             test -x /usr/local/bin/random-wait.sh
-            test -x /entrypoint.sh
+            test -x /usr/local/bin/network-runtime.sh
+            test -x "$(command -v curl)"
+            test -s /etc/ssl/certs/ca-certificates.crt
             grep -Fq -- "RANDOM_WAIT_PATCH_MARKER: validated random interval seam" /entrypoint.sh
-            . /usr/local/bin/random-wait.sh
-
-            unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX
-            validate_wait_config
-            for _ in 1 2 3 4 5 6 7 8; do
-              value=$(sample_wait_seconds)
-              [ "$value" -ge 5 ]
-              [ "$value" -le 50 ]
+            grep -Fq -- ". /usr/local/bin/network-runtime.sh" /entrypoint.sh
+            grep -Fq -- "run_url_download \"\$URL_DDL\"" /entrypoint.sh
+            grep -Fq -- "run_cf_speedtest_direct" /entrypoint.sh
+            grep -Fq -- "run_cf_speedtest_proxy" /entrypoint.sh
+            help_output=$(cf_speedtest --help 2>&1)
+            grep -Fq -- '--download-only' <<<"$help_output"
+          '
+      - name: Direct URL download smoke
+        run: |
+          set -euo pipefail
+          url_container="speedtest-diy-url-smoke-${GITHUB_RUN_ID:-local}"
+          url_url='https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz'
+          summary='URL download complete: total bytes=15152253, concurrent segments=4, transport=direct'
+          cleanup_url() {
+            docker rm -f "$url_container" >/dev/null 2>&1 || true
+          }
+          trap cleanup_url EXIT
+          docker run -d --name "$url_container" --platform linux/amd64 \
+            -e RUN_SPEEDTEST_DIRECT=false \
+            -e RUN_SPEEDTEST_PROXY=false \
+            -e PROXY_CONFIG='' \
+            -e DOWNLOAD_THREADS=4 \
+            -e URL_DDL="$url_url" \
+            -e HTTP_PROXY='poison-HTTP_PROXY' \
+            -e HTTPS_PROXY='poison-HTTPS_PROXY' \
+            -e ALL_PROXY='poison-ALL_PROXY' \
+            -e NO_PROXY='poison-NO_PROXY' \
+            -e http_proxy='poison-http_proxy' \
+            -e https_proxy='poison-https_proxy' \
+            -e all_proxy='poison-all_proxy' \
+            -e no_proxy='poison-no_proxy' \
+            -e WAIT_TIME=300 \
+            "$IMAGE" >/dev/null
+          # shellcheck disable=SC2016
+          timeout 180s bash -c '
+            set -eu
+            container_name=$1
+            summary=$2
+            while :; do
+              url_logs=$(docker logs "$container_name" 2>&1 || true)
+              if [ "$(grep -Fxc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]; then
+                exit 0
+              fi
+              sleep 1
             done
-
-            unset WAIT_TIME
-            WAIT_TIME_MIN=9
-            WAIT_TIME_MAX=9
-            [ "$(sample_wait_seconds)" = 9 ]
-
-            WAIT_TIME=13
-            WAIT_TIME_MIN=50
-            WAIT_TIME_MAX=5
-            [ "$(sample_wait_seconds)" = 13 ]
-
-            unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX
-            WAIT_TIME=0
-            if validate_wait_config; then
-              printf "invalid WAIT_TIME unexpectedly passed\\n" >&2
+          ' _ "$url_container" "$summary"
+          timeout 10s docker stop --time 5 "$url_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$url_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$url_container")" = 0 ]
+          url_logs=$(docker logs "$url_container" 2>&1 || true)
+          [ "$(grep -Fxc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]
+          if grep -Fq -- "$url_url" <<<"$url_logs"; then
+            printf '%s\n' 'URL appeared in the URL download smoke logs' >&2
+            exit 1
+          fi
+          for forbidden in 'saved' 'Downloading' 'progress' '%'; do
+            if grep -Fq -- "$forbidden" <<<"$url_logs"; then
+              printf '%s\n' "unexpected URL/progress noise: $forbidden" >&2
               exit 1
             fi
-          '
+          done
+      - name: Generated entrypoint download-only smoke
+        run: |
+          set -euo pipefail
+          fake_root="$RUNNER_TEMP/speedtest-diy-only-down-${GITHUB_RUN_ID:-local}"
+          fake_cf="$fake_root/cf_speedtest"
+          fake_state="$fake_root/state"
+          only_down_container="speedtest-diy-only-down-${GITHUB_RUN_ID:-local}"
+          mkdir -p "$fake_state"
+          cleanup_only_down() {
+            docker rm -f "$only_down_container" >/dev/null 2>&1 || true
+            rm -rf -- "$fake_root"
+          }
+          trap cleanup_only_down EXIT
+          cat >"$fake_cf" <<'FAKE_CF'
+          #!/usr/bin/env bash
+          set -eu
+          for proxy_key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+            if printenv "$proxy_key" >/dev/null 2>&1; then
+              printf 'ambient proxy variable remained: %s\n' "$proxy_key" >&2
+              exit 97
+            fi
+          done
+          printf 'args=%s\n' "$*" >> /tmp/speedtest-diy-fake-state/cf.calls
+          printf '%s\n' "$$" > /tmp/speedtest-diy-fake-state/cf.pid
+          trap ':' TERM INT
+          while [[ ! -e /tmp/speedtest-diy-fake-state/release-cf ]]; do
+            sleep 0.05
+          done
+          exit 0
+          FAKE_CF
+          chmod 0755 "$fake_cf"
+          docker run -d --name "$only_down_container" --platform linux/amd64 \
+            --mount type=bind,src="$fake_cf",dst=/usr/local/bin/cf_speedtest,readonly \
+            --mount type=bind,src="$fake_state",dst=/tmp/speedtest-diy-fake-state \
+            -e RUN_SPEEDTEST_DIRECT=true \
+            -e RUN_SPEEDTEST_PROXY=false \
+            -e PROXY_CONFIG='' \
+            -e HTTP_PROXY='poison-HTTP_PROXY' \
+            -e HTTPS_PROXY='poison-HTTPS_PROXY' \
+            -e ALL_PROXY='poison-ALL_PROXY' \
+            -e NO_PROXY='poison-NO_PROXY' \
+            -e http_proxy='poison-http_proxy' \
+            -e https_proxy='poison-https_proxy' \
+            -e all_proxy='poison-all_proxy' \
+            -e no_proxy='poison-no_proxy' \
+            -e URL_DDL='' \
+            -e SPEEDTEST_DOWNLOAD_ONLY=true \
+            -e DOWNLOAD_THREADS=4 \
+            -e WAIT_TIME=30 \
+            -e TEST_DURATION=10 \
+            "$IMAGE" >/dev/null
+          # shellcheck disable=SC2016
+          timeout 90s bash -c '
+            set -eu
+            container_name=$1
+            state_dir=$2
+            while :; do
+              only_down_logs=$(docker logs "$container_name" 2>&1 || true)
+              if grep -Fq -- "Starting direct speed test (download-only, 10 sec)" <<<"$only_down_logs" &&
+                  [ -s "$state_dir/cf.calls" ] && [ -s "$state_dir/cf.pid" ]; then
+                exit 0
+              fi
+              sleep 1
+            done
+          ' _ "$only_down_container" "$fake_state"
+          only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)
+          [ -s "$fake_state/cf.pid" ]
+          grep -Fq -- 'Starting direct speed test (download-only, 10 sec)' <<<"$only_down_logs"
+          grep -Fq -- '--download-only' "$fake_state/cf.calls"
+          grep -Fq -- '--download-threads 4' "$fake_state/cf.calls"
+          if grep -Fq -- 'Starting direct speed test (download and upload' <<<"$only_down_logs"; then
+            printf '%s\n' 'download-and-upload start appeared in download-only smoke' >&2
+            exit 1
+          fi
+          for forbidden in \
+              'Arrêt du script demandé.' \
+              'Lancement du test de vitesse en direct...' \
+              'Erreur : Échec du test de vitesse en direct' \
+              'Test de vitesse en direct désactivé.' \
+              'Lancement du test de vitesse via proxychains4...' \
+              'Erreur : Échec du test de vitesse via proxychains' \
+              'Test de vitesse via proxychains désactivé.' \
+              'Lancement du téléchargement depuis :' \
+              'La variable URL_DDL est vide. Téléchargement annulé.' \
+              'Démarrage dans 5 secondes...' \
+              'Attente de'; do
+            if grep -Fq -- "$forbidden" <<<"$only_down_logs"; then
+              printf '%s\n' "unexpected French or obsolete log: $forbidden" >&2
+              exit 1
+            fi
+          done
+          timeout 10s docker stop --time 5 "$only_down_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$only_down_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$only_down_container")" = 0 ]
+          only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)
+          grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$only_down_logs"
+      - name: Empty proxy speed-test protection smoke
+        run: |
+          set -euo pipefail
+          empty_proxy_root="$RUNNER_TEMP/speedtest-diy-empty-proxy-${GITHUB_RUN_ID:-local}"
+          empty_proxy_fake_cf="$empty_proxy_root/cf_speedtest"
+          empty_proxy_state="$empty_proxy_root/state"
+          empty_proxy_container="speedtest-diy-empty-proxy-${GITHUB_RUN_ID:-local}"
+          warning='WARNING: proxy speed test skipped: PROXY_CONFIG is empty or unset.'
+          mkdir -p "$empty_proxy_state"
+          cleanup_empty_proxy() {
+            docker rm -f "$empty_proxy_container" >/dev/null 2>&1 || true
+            rm -rf -- "$empty_proxy_root"
+          }
+          trap cleanup_empty_proxy EXIT
+          cat >"$empty_proxy_fake_cf" <<'FAKE_CF'
+          #!/usr/bin/env bash
+          set -eu
+          printf 'called\n' >> /tmp/speedtest-diy-empty-proxy-state/cf.calls
+          exit 0
+          FAKE_CF
+          chmod 0755 "$empty_proxy_fake_cf"
+          docker run -d --name "$empty_proxy_container" --platform linux/amd64 \
+            --mount type=bind,src="$empty_proxy_fake_cf",dst=/usr/local/bin/cf_speedtest,readonly \
+            --mount type=bind,src="$empty_proxy_state",dst=/tmp/speedtest-diy-empty-proxy-state \
+            -e RUN_SPEEDTEST_DIRECT=false \
+            -e RUN_SPEEDTEST_PROXY=true \
+            -e PROXY_CONFIG='' \
+            -e URL_DDL='' \
+            -e SPEEDTEST_DOWNLOAD_ONLY=false \
+            -e DOWNLOAD_THREADS=4 \
+            -e WAIT_TIME=30 \
+            "$IMAGE" >/dev/null
+          # shellcheck disable=SC2016
+          timeout 60s bash -c '
+            set -eu
+            container_name=$1
+            warning=$2
+            while :; do
+              empty_proxy_logs=$(docker logs "$container_name" 2>&1 || true)
+              if [ "$(grep -Fxc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ] &&
+                  grep -Fq -- "Waiting 30 seconds before running the tests again..." <<<"$empty_proxy_logs"; then
+                exit 0
+              fi
+              sleep 1
+            done
+          ' _ "$empty_proxy_container" "$warning"
+          empty_proxy_logs=$(docker logs "$empty_proxy_container" 2>&1 || true)
+          [ "$(grep -Fxc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ]
+          grep -Fq -- 'Waiting 30 seconds before running the tests again...' <<<"$empty_proxy_logs"
+          [ ! -e "$empty_proxy_state/cf.calls" ]
+          timeout 10s docker stop --time 5 "$empty_proxy_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$empty_proxy_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$empty_proxy_container")" = 0 ]
+          empty_proxy_logs=$(docker logs "$empty_proxy_container" 2>&1 || true)
+          grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$empty_proxy_logs"
       - name: Verify SIGTERM shutdown
         run: |
           set -euo pipefail
+          fake_root="$RUNNER_TEMP/speedtest-diy-defaults-${GITHUB_RUN_ID:-local}"
+          fake_cf="$fake_root/cf_speedtest"
+          fake_state="$fake_root/state"
+          mkdir -p "$fake_state"
+          cat >"$fake_cf" <<'FAKE_CF'
+          #!/usr/bin/env bash
+          set -eu
+          printf 'called\n' >> /tmp/speedtest-diy-default-state/cf.calls
+          exit 99
+          FAKE_CF
+          chmod 0755 "$fake_cf"
           container_id=$(docker run -d --platform linux/amd64 \
-            -e RUN_SPEEDTEST_DIRECT=false \
-            -e RUN_SPEEDTEST_PROXY=false \
+            --mount type=bind,src="$fake_cf",dst=/usr/local/bin/cf_speedtest,readonly \
+            --mount type=bind,src="$fake_state",dst=/tmp/speedtest-diy-default-state \
             -e URL_DDL='' \
             -e WAIT_TIME=30 \
             "$IMAGE")
           cleanup() {
             docker rm -f "$container_id" >/dev/null 2>&1 || true
+            rm -rf -- "$fake_root"
           }
           trap cleanup EXIT
           logs=''
@@ -135,6 +334,8 @@ jobs:
           done
           timeout 10s docker stop --time 5 "$container_id"
           [ "$(docker inspect -f '{{.State.Running}}' "$container_id")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$container_id")" = 0 ]
+          [ ! -e "$fake_state/cf.calls" ]
           logs=$(docker logs "$container_id" 2>&1 || true)
           if ! grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$logs"; then
             printf '%s\n' 'missing English shutdown log: Stop requested. Cleaning up and exiting...' >&2
@@ -144,6 +345,40 @@ jobs:
           if grep -Fq -- 'Arrêt du script demandé.' <<<"$logs"; then
             printf '%s\n' 'unexpected French shutdown log: Arrêt du script demandé.' >&2
             printf '%s\n' "$logs" >&2
+            exit 1
+          fi
+
+      - name: Verify SIGTERM during initial wait
+        run: |
+          set -euo pipefail
+          initial_container="speedtest-diy-initial-wait-${GITHUB_RUN_ID:-local}"
+          cleanup_initial() {
+            docker rm -f "$initial_container" >/dev/null 2>&1 || true
+          }
+          trap cleanup_initial EXIT
+          docker run -d --name "$initial_container" --platform linux/amd64 \
+            -e URL_DDL='' \
+            -e WAIT_TIME=30 \
+            "$IMAGE" >/dev/null
+          # shellcheck disable=SC2016
+          timeout 15s bash -c '
+            set -eu
+            container_name=$1
+            while :; do
+              initial_logs=$(docker logs "$container_name" 2>&1 || true)
+              if grep -Fq -- "Starting in 5 seconds..." <<<"$initial_logs"; then
+                exit 0
+              fi
+              sleep 1
+            done
+          ' _ "$initial_container"
+          timeout 10s docker stop --time 5 "$initial_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$initial_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$initial_container")" = 0 ]
+          initial_logs=$(docker logs "$initial_container" 2>&1 || true)
+          grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$initial_logs"
+          if grep -Fq -- 'Arrêt du script demandé.' <<<"$initial_logs"; then
+            printf '%s\n' 'unexpected French shutdown log during initial wait' >&2
             exit 1
           fi
 
@@ -171,6 +406,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/wujun8/speedtest-diy
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
@@ -197,37 +434,112 @@ jobs:
     env:
       IMAGE: ghcr.io/wujun8/speedtest-diy
     steps:
-      - name: Pull and run GHCR image anonymously
+      - name: Pull, inspect, and run GHCR images anonymously
         run: |
           set -euo pipefail
           export DOCKER_CONFIG="$RUNNER_TEMP/speedtest-diy-anonymous-docker-config"
           rm -rf -- "$DOCKER_CONFIG"
           mkdir -p -- "$DOCKER_CONFIG"
           unset DOCKER_AUTH_CONFIG
-          image="$IMAGE:sha-${GITHUB_SHA::7}"
-          docker pull --platform linux/amd64 "$image"
-          container_id=$(docker run -d --platform linux/amd64 \
+          sha_image="$IMAGE:sha-${GITHUB_SHA::7}"
+          sha_container="speedtest-diy-published-sha-${GITHUB_RUN_ID:-local}"
+          sha_url_container="speedtest-diy-published-sha-url-${GITHUB_RUN_ID:-local}"
+          cleanup_public() {
+            docker rm -f "$sha_container" >/dev/null 2>&1 || true
+            docker rm -f "$sha_url_container" >/dev/null 2>&1 || true
+            rm -rf -- "$DOCKER_CONFIG"
+          }
+          trap cleanup_public EXIT
+          docker pull --platform linux/amd64 "$sha_image"
+          sha_id=$(docker image inspect --format '{{.Id}}' "$sha_image")
+          case "$GITHUB_REF" in
+            refs/heads/main)
+              latest_image="$IMAGE:latest"
+              docker pull --platform linux/amd64 "$latest_image"
+              latest_id=$(docker image inspect --format '{{.Id}}' "$latest_image")
+              [ "$latest_id" = "$sha_id" ]
+              ;;
+            refs/tags/v*)
+              ;;
+            *)
+              printf '%s\n' "unexpected publication ref: $GITHUB_REF" >&2
+              exit 1
+              ;;
+          esac
+          docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$sha_image" -c '
+            set -eu
+            test -x /usr/local/bin/network-runtime.sh
+            test -x "$(command -v curl)"
+            test -s /etc/ssl/certs/ca-certificates.crt
+          '
+          docker run -d --name "$sha_container" --platform linux/amd64 \
             -e RUN_SPEEDTEST_DIRECT=false \
             -e RUN_SPEEDTEST_PROXY=false \
             -e URL_DDL='' \
             -e WAIT_TIME=30 \
-            "$image")
-          cleanup() {
-            docker rm -f "$container_id" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
+            "$sha_image" >/dev/null
           reached_wait=false
           for _ in 1 2 3 4 5 6 7 8 9 10; do
-            if docker logs "$container_id" 2>&1 | grep -Fq -- 'Waiting 30 seconds before running the tests again...'; then
+            sha_logs=$(docker logs "$sha_container" 2>&1 || true)
+            if grep -Fq -- 'Waiting 30 seconds before running the tests again...' <<<"$sha_logs"; then
               reached_wait=true
               break
             fi
             sleep 1
           done
           if [ "$reached_wait" != true ]; then
-            docker logs "$container_id" >&2 || true
-            printf '%s\n' 'anonymous GHCR image did not reach its wait interval' >&2
+            docker logs "$sha_container" >&2 || true
+            printf '%s\n' 'anonymous sha image did not reach its wait interval' >&2
             exit 1
           fi
-          timeout 10s docker stop --time 5 "$container_id"
-          [ "$(docker inspect -f '{{.State.Running}}' "$container_id")" = false ]
+          timeout 10s docker stop --time 5 "$sha_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$sha_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$sha_container")" = 0 ]
+          sha_logs=$(docker logs "$sha_container" 2>&1 || true)
+          grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$sha_logs"
+          sha_url='https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz'
+          summary='URL download complete: total bytes=15152253, concurrent segments=4, transport=direct'
+          docker run -d --name "$sha_url_container" --platform linux/amd64 \
+            -e RUN_SPEEDTEST_DIRECT=false \
+            -e RUN_SPEEDTEST_PROXY=false \
+            -e PROXY_CONFIG='' \
+            -e HTTP_PROXY='poison-HTTP_PROXY' \
+            -e HTTPS_PROXY='poison-HTTPS_PROXY' \
+            -e ALL_PROXY='poison-ALL_PROXY' \
+            -e NO_PROXY='poison-NO_PROXY' \
+            -e http_proxy='poison-http_proxy' \
+            -e https_proxy='poison-https_proxy' \
+            -e all_proxy='poison-all_proxy' \
+            -e no_proxy='poison-no_proxy' \
+            -e DOWNLOAD_THREADS=4 \
+            -e URL_DDL="$sha_url" \
+            -e WAIT_TIME=300 \
+            "$sha_image" >/dev/null
+          # shellcheck disable=SC2016
+          timeout 180s bash -c '
+            set -eu
+            container_name=$1
+            summary=$2
+            while :; do
+              sha_url_logs=$(docker logs "$container_name" 2>&1 || true)
+              if [ "$(grep -Fxc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]; then
+                exit 0
+              fi
+              sleep 1
+            done
+          ' _ "$sha_url_container" "$summary"
+          timeout 10s docker stop --time 5 "$sha_url_container"
+          [ "$(docker inspect -f '{{.State.Running}}' "$sha_url_container")" = false ]
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$sha_url_container")" = 0 ]
+          sha_url_logs=$(docker logs "$sha_url_container" 2>&1 || true)
+          [ "$(grep -Fxc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]
+          if grep -Fq -- "$sha_url" <<<"$sha_url_logs"; then
+            printf '%s\n' 'URL appeared in the public URL smoke logs' >&2
+            exit 1
+          fi
+          for forbidden in 'saved' 'Downloading' 'progress' '%'; do
+            if grep -Fq -- "$forbidden" <<<"$sha_url_logs"; then
+              printf '%s\n' "unexpected public URL/progress noise: $forbidden" >&2
+              exit 1
+            fi
+          done
