@@ -145,6 +145,152 @@ fn next_meas_id() -> u64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransferSample {
+    bytes: usize,
+    bytes_per_second: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AttemptFailure {
+    RateLimited(Option<String>),
+    HttpStatus(u16),
+    Transport,
+    InvalidBodyLength { expected: usize, actual: usize },
+}
+
+fn transfer_sample(bytes: usize, started_at: Instant) -> TransferSample {
+    let elapsed_nanos = started_at.elapsed().as_nanos().max(1);
+    let bytes_per_second = (bytes as u128)
+        .saturating_mul(1_000_000_000)
+        .checked_div(elapsed_nanos)
+        .unwrap_or(0)
+        .min(usize::MAX as u128) as usize;
+
+    TransferSample {
+        bytes,
+        bytes_per_second: if bytes == 0 {
+            0
+        } else {
+            bytes_per_second.max(1)
+        },
+    }
+}
+
+fn download_once(
+    agent: &Agent,
+    base_url: &str,
+    requested_bytes: usize,
+    meas_id: u64,
+) -> std::result::Result<TransferSample, AttemptFailure> {
+    let started_at = Instant::now();
+    let url = format!("{base_url}/__down?measId={meas_id}&bytes={requested_bytes}");
+    let mut response = agent
+        .get(url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .map_err(|_| AttemptFailure::Transport)?;
+
+    let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        return Err(AttemptFailure::RateLimited(retry_after));
+    }
+    if !(200..300).contains(&status) {
+        return Err(AttemptFailure::HttpStatus(status));
+    }
+
+    let actual_bytes = std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+        .map_err(|_| AttemptFailure::Transport)?;
+    let actual_bytes = usize::try_from(actual_bytes).unwrap_or(usize::MAX);
+    if actual_bytes != requested_bytes {
+        return Err(AttemptFailure::InvalidBodyLength {
+            expected: requested_bytes,
+            actual: actual_bytes,
+        });
+    }
+
+    Ok(transfer_sample(actual_bytes, started_at))
+}
+
+fn upload_once(
+    agent: &Agent,
+    base_url: &str,
+    requested_bytes: usize,
+    meas_id: u64,
+) -> std::result::Result<TransferSample, AttemptFailure> {
+    let started_at = Instant::now();
+    let url = format!("{base_url}/__up?measId={meas_id}");
+    let body = vec![1u8; requested_bytes];
+    let mut response = agent
+        .post(url)
+        .header("Content-Type", "text/plain;charset=UTF-8")
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(body)
+        .map_err(|_| AttemptFailure::Transport)?;
+
+    let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        return Err(AttemptFailure::RateLimited(retry_after));
+    }
+    if !(200..300).contains(&status) {
+        return Err(AttemptFailure::HttpStatus(status));
+    }
+
+    std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+        .map_err(|_| AttemptFailure::Transport)?;
+
+    Ok(transfer_sample(requested_bytes, started_at))
+}
+
+fn execute_with_retry<F, S>(
+    policy: RetryPolicy,
+    mut attempt: F,
+    mut sleeper: S,
+) -> std::result::Result<TransferSample, AttemptFailure>
+where
+    F: FnMut(u64) -> std::result::Result<TransferSample, AttemptFailure>,
+    S: FnMut(u64),
+{
+    let mut retry_index = 0;
+
+    loop {
+        let meas_id = next_meas_id();
+        match attempt(meas_id) {
+            Ok(sample) => return Ok(sample),
+            Err(failure) => {
+                let AttemptFailure::RateLimited(retry_after) = &failure else {
+                    return Err(failure);
+                };
+
+                match policy.decide(429, retry_after.as_deref(), retry_index) {
+                    RetryDecision::Retry { delay_secs } => {
+                        let fallback_delay_secs = policy
+                            .fallback_delay_secs
+                            .saturating_add(retry_index as u64);
+                        sleeper(delay_secs.max(fallback_delay_secs));
+                        retry_index = retry_index.saturating_add(1);
+                    }
+                    RetryDecision::Abort | RetryDecision::NoRetry => return Err(failure),
+                }
+            }
+        }
+    }
+}
+
 fn build_request_url(direction: Direction, bytes: usize, id: u64) -> String {
     assert!(id != 0, "measurement id must be non-zero");
 
