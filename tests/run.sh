@@ -451,6 +451,8 @@ compose_contract() {
         '      TEST_DURATION: "${TEST_DURATION:-10}"' \
         '      DOWNLOAD_THREADS: "${DOWNLOAD_THREADS:-4}"' \
         '      UPLOAD_THREADS: "${UPLOAD_THREADS:-4}"' \
+        '      SPEEDTEST_DOWNLOAD_BYTES: "${SPEEDTEST_DOWNLOAD_BYTES:-10485760}"' \
+        '      SPEEDTEST_UPLOAD_BYTES: "${SPEEDTEST_UPLOAD_BYTES:-10485760}"' \
         '      SPEEDTEST_DOWNLOAD_ONLY: "${SPEEDTEST_DOWNLOAD_ONLY:-false}"' \
         '      RUN_SPEEDTEST_DIRECT: "${RUN_SPEEDTEST_DIRECT:-false}"' \
         '      RUN_SPEEDTEST_PROXY: "${RUN_SPEEDTEST_PROXY:-false}"' \
@@ -468,7 +470,7 @@ compose_contract() {
         printf 'FAIL: Compose contract (ports/volumes are forbidden)\n' >&2
         return 1
     fi
-    if grep -nE '^[[:space:]]*-[[:space:]]*(URL_DDL|WAIT_TIME_MIN|WAIT_TIME_MAX|TEST_DURATION|DOWNLOAD_THREADS|UPLOAD_THREADS|SPEEDTEST_DOWNLOAD_ONLY|RUN_SPEEDTEST_DIRECT|RUN_SPEEDTEST_PROXY|PROXY_CONFIG)(:|[[:space:]])' "$file"; then
+    if grep -nE '^[[:space:]]*-[[:space:]]*(URL_DDL|WAIT_TIME_MIN|WAIT_TIME_MAX|TEST_DURATION|DOWNLOAD_THREADS|UPLOAD_THREADS|SPEEDTEST_DOWNLOAD_BYTES|SPEEDTEST_UPLOAD_BYTES|SPEEDTEST_DOWNLOAD_ONLY|RUN_SPEEDTEST_DIRECT|RUN_SPEEDTEST_PROXY|PROXY_CONFIG)(:|[[:space:]])' "$file"; then
         printf 'FAIL: Compose contract (environment must use a mapping)\n' >&2
         return 1
     fi
@@ -500,7 +502,16 @@ documentation_contract() {
     for needle in \
         'WAIT_TIME_MIN' 'WAIT_TIME_MAX' 'WAIT_TIME' 'PROXY_CONFIG' \
         'TEST_DURATION' 'DOWNLOAD_THREADS' 'UPLOAD_THREADS' \
+        'SPEEDTEST_DOWNLOAD_BYTES' 'SPEEDTEST_UPLOAD_BYTES' \
         'SPEEDTEST_DOWNLOAD_ONLY' 'RUN_SPEEDTEST_DIRECT' 'RUN_SPEEDTEST_PROXY' 'URL_DDL' \
+        '10485760' '10 MiB' '1～2147483647' '单次 HTTP 请求' \
+        'measId' '每次实际请求' '429 重试' '非零' \
+        '250 ms' '共享请求门控' \
+        '最多重试 2 次' '总计最多 3 次请求' 'Retry-After' '1～30 秒' \
+        '无效或缺失时依次等待 1 秒、2 秒' '超过 30 秒' 'fail closed' '非 429 不重试' \
+        '无有效样本' '非零退出' '不输出全零测速结果表' '已有有效样本后发生终止错误' \
+        'UTC' 'ISO-8601' '[YYYY-MM-DDTHH:MM:SS.mmmZ]' '每一物理行' \
+        '仍可能收到 HTTP 429' \
         'DOWNLOAD_THREADS` 同时控制 `cf_speedtest` 的下载线程数和 `URL_DDL` 的分段连接 worker 数；有效范围为 1～64。' \
         'N>1` 时先发起 `bytes 0-0` 的一字节 Range probe，再发起互不重叠的 Range 请求覆盖 `byte 1` 到对象末尾。' \
         '`probe` 计入 `byte 0`，所有响应体都写入 `/dev/null`，因此总响应体仍是一个对象。' \
@@ -546,7 +557,8 @@ documentation_contract() {
         '除等待 seam 外' \
         '只在构建期对等待间隔 seam 做精确补丁' \
         'URL_DDL 仍经' \
-        '不能修改为绕过'; do
+        '不能修改为绕过' \
+        '固定 measId=0'; do
         require_no_line "$file" "$obsolete" "README obsolete claim removal" || return 1
     done
 }
@@ -558,6 +570,13 @@ notice_contract() {
     require_line "$file" 'source' 'NOTICE source fact' || return 1
     require_line "$file" '未发现上游许可声明' 'NOTICE license fact' || return 1
     require_line "$file" '自行核对上游条款' 'NOTICE terms reminder' || return 1
+    require_line "$file" '12932/cf_speedtest' 'NOTICE cf_speedtest source' || return 1
+    require_line "$file" '0.5.2' 'NOTICE cf_speedtest version' || return 1
+    require_line "$file" '7824731cc7c448a0cffa12d7a20cd4d7daa25b63' 'NOTICE cf_speedtest commit' || return 1
+    require_line "$file" '69e019aeaca727b9ca485deb11c4bfd1903b4a0b' 'NOTICE cf_speedtest tree' || return 1
+    require_line "$file" 'MIT' 'NOTICE cf_speedtest license' || return 1
+    require_line "$file" '/usr/share/doc/cf_speedtest/LICENSE.txt' 'NOTICE installed license path' || return 1
+    require_line "$file" '不重新授权继承的基础镜像层' 'NOTICE inherited-layer non-relicensing' || return 1
 }
 
 run_group 'test fixture portability' portability_contract
