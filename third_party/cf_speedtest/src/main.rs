@@ -1,13 +1,11 @@
+use argh::FromArgs;
 use chrono::{DateTime, SecondsFormat, Utc};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
-use std::io::Read;
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::vec;
 use ureq::Agent;
 
 mod args;
@@ -23,10 +21,7 @@ mod tests;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-static CLOUDFLARE_SPEEDTEST_DOWNLOAD_URL: &str = "https://speed.cloudflare.com/__down?measId=0";
-static CLOUDFLARE_SPEEDTEST_UPLOAD_URL: &str = "https://speed.cloudflare.com/__up?measId=0";
-static CLOUDFLARE_SPEEDTEST_SERVER_URL: &str =
-    "https://speed.cloudflare.com/__down?measId=0&bytes=0";
+static CLOUDFLARE_SPEEDTEST_BASE_URL: &str = "https://speed.cloudflare.com";
 static CLOUDFLARE_SPEEDTEST_CGI_URL: &str = "https://speed.cloudflare.com/cdn-cgi/trace";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +29,24 @@ enum Direction {
     Download,
     Upload,
     Both,
+}
+
+impl Direction {
+    fn from_args(args: &UserArgs) -> Self {
+        match (args.download_only, args.upload_only) {
+            (true, false) => Self::Download,
+            (false, true) => Self::Upload,
+            _ => Self::Both,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Upload => "upload",
+            Self::Both => "download/upload",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,7 +241,23 @@ enum AttemptFailure {
     InvalidBodyLength { expected: usize, actual: usize },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl std::fmt::Display for AttemptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited(_) => formatter.write_str("HTTP 429 retry budget exhausted"),
+            Self::HttpStatus(status) => write!(formatter, "HTTP status {status}"),
+            Self::Transport => formatter.write_str("transport error"),
+            Self::InvalidBodyLength { expected, actual } => write!(
+                formatter,
+                "invalid response body length: expected {expected}, actual {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttemptFailure {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DirectionStateSnapshot {
     valid_sample_count: usize,
     confirmed_bytes: usize,
@@ -245,14 +274,20 @@ struct DirectionStateInner {
     stop: bool,
 }
 
+type RetryLogger = Arc<dyn Fn(Direction, u64) + Send + Sync>;
+
 struct DirectionState {
     inner: Mutex<DirectionStateInner>,
+    retry_logger: Mutex<Option<RetryLogger>>,
+    direction: Mutex<Direction>,
 }
 
 impl Default for DirectionState {
     fn default() -> Self {
         Self {
             inner: Mutex::new(DirectionStateInner::default()),
+            retry_logger: Mutex::new(None),
+            direction: Mutex::new(Direction::Download),
         }
     }
 }
@@ -281,6 +316,39 @@ impl DirectionState {
         if state.terminal_error.is_none() {
             state.terminal_error = Some(failure);
         }
+    }
+
+    fn stop_normally(&self) {
+        self.lock_inner().stop = true;
+    }
+
+    fn set_retry_logger(&self, retry_logger: RetryLogger) {
+        *self
+            .retry_logger
+            .lock()
+            .unwrap_or_else(|_| panic!("direction retry logger mutex is poisoned")) =
+            Some(retry_logger);
+    }
+
+    fn retry_logger(&self) -> Option<RetryLogger> {
+        self.retry_logger
+            .lock()
+            .unwrap_or_else(|_| panic!("direction retry logger mutex is poisoned"))
+            .clone()
+    }
+
+    fn set_direction(&self, direction: Direction) {
+        *self
+            .direction
+            .lock()
+            .unwrap_or_else(|_| panic!("direction mutex is poisoned")) = direction;
+    }
+
+    fn direction(&self) -> Direction {
+        *self
+            .direction
+            .lock()
+            .unwrap_or_else(|_| panic!("direction mutex is poisoned"))
     }
 
     fn snapshot(&self) -> DirectionStateSnapshot {
@@ -323,7 +391,10 @@ fn download_once(
     meas_id: u64,
 ) -> std::result::Result<TransferSample, AttemptFailure> {
     let started_at = Instant::now();
-    let url = format!("{base_url}/__down?measId={meas_id}&bytes={requested_bytes}");
+    let url = format!(
+        "{}/__down?measId={meas_id}&bytes={requested_bytes}",
+        base_url.trim_end_matches('/')
+    );
     let mut response = agent
         .get(url)
         .config()
@@ -339,9 +410,13 @@ fn download_once(
             .get("Retry-After")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+            .map_err(|_| AttemptFailure::Transport)?;
         return Err(AttemptFailure::RateLimited(retry_after));
     }
     if !(200..300).contains(&status) {
+        std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+            .map_err(|_| AttemptFailure::Transport)?;
         return Err(AttemptFailure::HttpStatus(status));
     }
 
@@ -365,7 +440,7 @@ fn upload_once(
     meas_id: u64,
 ) -> std::result::Result<TransferSample, AttemptFailure> {
     let started_at = Instant::now();
-    let url = format!("{base_url}/__up?measId={meas_id}");
+    let url = format!("{}/__up?measId={meas_id}", base_url.trim_end_matches('/'));
     let body = vec![1u8; requested_bytes];
     let mut response = agent
         .post(url)
@@ -383,9 +458,13 @@ fn upload_once(
             .get("Retry-After")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+            .map_err(|_| AttemptFailure::Transport)?;
         return Err(AttemptFailure::RateLimited(retry_after));
     }
     if !(200..300).contains(&status) {
+        std::io::copy(&mut response.body_mut().as_reader(), &mut std::io::sink())
+            .map_err(|_| AttemptFailure::Transport)?;
         return Err(AttemptFailure::HttpStatus(status));
     }
 
@@ -447,6 +526,10 @@ fn is_valid_download_sample(requested: usize, body: &[u8]) -> bool {
 }
 
 fn format_timestamped_lines(timestamp: DateTime<Utc>, message: &str) -> String {
+    if message.is_empty() {
+        return String::new();
+    }
+
     let prefix = format!(
         "[{}] ",
         timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -459,6 +542,33 @@ fn format_timestamped_lines(timestamp: DateTime<Utc>, message: &str) -> String {
     }
 
     formatted
+}
+
+struct ThreadSafeLogger<W: std::io::Write + Send> {
+    writer: Arc<Mutex<W>>,
+}
+
+impl<W: std::io::Write + Send> ThreadSafeLogger<W> {
+    fn new(writer: Arc<Mutex<W>>) -> Self {
+        Self { writer }
+    }
+
+    fn log_at(&self, timestamp: DateTime<Utc>, message: &str) -> std::io::Result<()> {
+        let formatted = format_timestamped_lines(timestamp, message);
+        if formatted.is_empty() {
+            return Ok(());
+        }
+
+        let mut writer = self.writer.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "logger writer mutex is poisoned")
+        })?;
+        writer.write_all(formatted.as_bytes())?;
+        writer.flush()
+    }
+
+    fn log(&self, message: &str) -> std::io::Result<()> {
+        self.log_at(Utc::now(), message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,17 +660,20 @@ fn classify_direction_run_result(
     }
 }
 
-fn run_worker_cycle<N, S, A>(
+fn run_worker_cycle_with_retry_log<N, S, A, L>(
+    direction: Direction,
     state: &DirectionState,
     gate: &RuntimeRequestGate,
     mut attempt: A,
     mut now_ms: N,
     mut sleeper: S,
+    mut retry_logger: L,
 ) -> std::result::Result<(), AttemptFailure>
 where
     N: FnMut() -> u64,
     S: FnMut(u64),
     A: FnMut(u64) -> std::result::Result<TransferSample, AttemptFailure>,
+    L: FnMut(Direction, u64),
 {
     let policy = RetryPolicy::default();
     let mut retry_index = 0;
@@ -585,6 +698,7 @@ where
                 if let AttemptFailure::RateLimited(retry_after) = &failure {
                     match policy.decide(429, retry_after.as_deref(), retry_index) {
                         RetryDecision::Retry { delay_secs } => {
+                            retry_logger(direction, delay_secs);
                             let delay_ms = delay_secs.saturating_mul(1_000);
                             let retry_deadline_ms = now_ms().saturating_add(delay_ms);
                             gate.extend_retry_deadline_ms(retry_deadline_ms);
@@ -602,6 +716,82 @@ where
     }
 }
 
+fn run_worker_cycle<N, S, A>(
+    state: &DirectionState,
+    gate: &RuntimeRequestGate,
+    attempt: A,
+    now_ms: N,
+    sleeper: S,
+) -> std::result::Result<(), AttemptFailure>
+where
+    N: FnMut() -> u64,
+    S: FnMut(u64),
+    A: FnMut(u64) -> std::result::Result<TransferSample, AttemptFailure>,
+{
+    let retry_logger = state.retry_logger();
+    let direction = state.direction();
+    run_worker_cycle_with_retry_log(
+        direction,
+        state,
+        gate,
+        attempt,
+        now_ms,
+        sleeper,
+        move |direction, delay_secs| {
+            if let Some(retry_logger) = &retry_logger {
+                retry_logger(direction, delay_secs);
+            }
+        },
+    )
+}
+
+fn classify_single_direction_run_result(state: &DirectionState) -> DirectionRunResult {
+    let snapshot = state.snapshot();
+    if snapshot.valid_sample_count == 0 {
+        DirectionRunResult::NoValidSamples
+    } else if snapshot.terminal_error.is_some() {
+        DirectionRunResult::TerminalFailure
+    } else {
+        DirectionRunResult::SuccessTable
+    }
+}
+
+fn run_direction_for_cycles<N, S, A>(
+    direction: Direction,
+    cycles: usize,
+    state: &DirectionState,
+    gate: &RuntimeRequestGate,
+    attempt: A,
+    now_ms: N,
+    sleeper: S,
+) -> DirectionRunResult
+where
+    N: FnMut() -> u64,
+    S: FnMut(u64),
+    A: FnMut(u64) -> std::result::Result<TransferSample, AttemptFailure>,
+{
+    let mut attempt = attempt;
+    let mut now_ms = now_ms;
+    let mut sleeper = sleeper;
+
+    for _ in 0..cycles {
+        if state.should_stop() {
+            break;
+        }
+
+        let cycle_result = run_worker_cycle(state, gate, &mut attempt, &mut now_ms, &mut sleeper);
+        if cycle_result.is_err() || state.should_stop() {
+            break;
+        }
+    }
+
+    match direction {
+        Direction::Download | Direction::Upload | Direction::Both => {
+            classify_single_direction_run_result(state)
+        }
+    }
+}
+
 static OUR_USER_AGENT: &str = concat!(
     "cf_speedtest (",
     env!("CARGO_PKG_VERSION"),
@@ -610,7 +800,6 @@ static OUR_USER_AGENT: &str = concat!(
 
 static CONNECT_TIMEOUT_MILLIS: u64 = 9600;
 static LATENCY_TEST_COUNT: u8 = 8;
-static NEW_METAL_SLEEP_MILLIS: u32 = 250;
 
 impl std::io::Read for UploadHelper {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -643,22 +832,6 @@ struct UploadHelper {
     byte_ctr: Arc<AtomicUsize>,
     total_uploaded_counter: Arc<AtomicUsize>,
     exit_signal: Arc<AtomicBool>,
-}
-
-fn get_secs_since_unix_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-// Default test duration + a little bit more if we have extra threads
-fn get_test_time(test_duration_seconds: u64, thread_count: u32) -> u64 {
-    if thread_count > 4 {
-        return test_duration_seconds + (thread_count as u64 - 4) / 4;
-    }
-
-    test_duration_seconds
 }
 
 /* Given n bytes, return
@@ -707,20 +880,18 @@ fn get_appropriate_byte_unit_rate(bytes: u64) -> (String, String) {
     (format!("{}/s", a), format!("{}it/s", b))
 }
 
-fn get_appropriate_buff_size(speed: usize) -> u64 {
-    match speed {
-        0..=1000 => 4,
-        1001..=10000 => 32,
-        10001..=100000 => 512,
-        100001..=1000000 => 4096,
-        _ => 16384,
-    }
-}
-
 // Use cloudflare's cdn-cgi endpoint to get our ip address country
 fn get_our_ip_address_country() -> Result<String> {
-    let mut resp = ureq::get(CLOUDFLARE_SPEEDTEST_CGI_URL).call()?;
-    let body: String = resp.body_mut().read_to_string()?;
+    let mut response = ureq::get(CLOUDFLARE_SPEEDTEST_CGI_URL)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_to_string()?;
+    if !(200..300).contains(&status) {
+        return Err(Box::new(AttemptFailure::HttpStatus(status)));
+    }
 
     for line in body.lines() {
         if let Some(loc) = line.strip_prefix("loc=") {
@@ -728,382 +899,316 @@ fn get_our_ip_address_country() -> Result<String> {
         }
     }
 
-    panic!(
-        "Could not find loc= in cdn-cgi response\n
-			Please update to the latest version and make a Github issue if the issue persists"
-    );
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Could not find loc= in cdn-cgi response",
+    )))
 }
 
 // Get http latency by requesting the cgi endpoint 8 times
 // and taking the fastest
 fn get_download_server_http_latency() -> Result<std::time::Duration> {
     let start = Instant::now();
-
     let my_agent = create_configured_agent();
     let mut latency_vec = Vec::new();
 
     for _ in 0..LATENCY_TEST_COUNT {
-        // if vec length 2 or greater and we've spent a lot of time
-        // 	calculating latency, exit early (we could be on satellite or sumthin)
-        if latency_vec.len() >= 2 && start.elapsed() > std::time::Duration::from_secs(1) {
+        if latency_vec.len() >= 2 && start.elapsed() > Duration::from_secs(1) {
             break;
         }
 
         let now = Instant::now();
-
-        let _response = my_agent
+        let mut response = my_agent
             .get(CLOUDFLARE_SPEEDTEST_CGI_URL)
-            .call()?
-            .body_mut()
-            .read_to_string();
-
-        let total_time = now.elapsed();
-        latency_vec.push(total_time);
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call()?;
+        let status = response.status().as_u16();
+        response.body_mut().read_to_string()?;
+        if !(200..300).contains(&status) {
+            return Err(Box::new(AttemptFailure::HttpStatus(status)));
+        }
+        latency_vec.push(now.elapsed());
     }
 
-    let best_time = latency_vec.iter().min().unwrap().to_owned();
-    Ok(best_time)
+    latency_vec.into_iter().min().ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Could not measure server latency",
+        )) as Box<dyn std::error::Error>
+    })
 }
 
-// return all cloufdlare headers from a request
-fn get_download_server_info() -> Result<std::collections::HashMap<String, String>> {
-    let mut server_headers = std::collections::HashMap::new();
-    let resp = ureq::get(CLOUDFLARE_SPEEDTEST_SERVER_URL)
-        .call()
-        .expect("Failed to get server info");
+fn get_download_server_info(agent: &Agent, base_url: &str) -> Result<String> {
+    let url = format!(
+        "{}/__down?measId={}&bytes=0",
+        base_url.trim_end_matches('/'),
+        next_meas_id()
+    );
+    let mut response = agent
+        .get(url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.body_mut().read_to_string()?;
 
-    // Using headers() instead of headers_names()
-    for header in resp.headers() {
-        let key_str = header.0.as_str();
-        if key_str.starts_with("cf-") {
-            server_headers.insert(
-                key_str.to_string(),
-                header.1.to_str().unwrap_or_default().to_string(),
-            );
-        }
+    if status == 429 {
+        return Err(Box::new(AttemptFailure::RateLimited(retry_after)));
+    }
+    if !(200..300).contains(&status) {
+        return Err(Box::new(AttemptFailure::HttpStatus(status)));
     }
 
-    Ok(server_headers)
+    Ok(body)
 }
 
-fn get_current_timestamp() -> String {
-    let now = chrono::Local::now();
+fn print_test_preamble<W: std::io::Write + Send>(logger: &ThreadSafeLogger<W>) -> Result<()> {
+    logger.log("Start:")?;
 
-    format!("{} {}", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"))
-}
-
-fn upload_test(
-    bytes: usize,
-    total_up_bytes_counter: &Arc<AtomicUsize>,
-    _current_speed: &Arc<AtomicUsize>,
-    exit_signal: &Arc<AtomicBool>,
-) -> Result<()> {
-    let agent: Agent = create_configured_agent();
-
-    loop {
-        let upload_helper = UploadHelper {
-            bytes_to_send: bytes,
-            byte_ctr: Arc::new(AtomicUsize::new(0)),
-            total_uploaded_counter: total_up_bytes_counter.clone(),
-            exit_signal: exit_signal.clone(),
-        };
-
-        let body = ureq::SendBody::from_owned_reader(upload_helper);
-
-        let resp = match agent
-            .post(CLOUDFLARE_SPEEDTEST_UPLOAD_URL)
-            .header("Content-Type", "text/plain;charset=UTF-8")
-            .send(body)
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                eprintln!("Error in upload thread: {err}");
-                return Ok(());
-            }
-        };
-
-        // Process the response
-        let _ = std::io::copy(&mut resp.into_body().into_reader(), &mut std::io::sink());
-
-        if exit_signal.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-    }
-}
-
-// download some bytes from cloudflare
-fn download_test(
-    bytes_to_request: usize,
-    total_bytes_counter: &Arc<AtomicUsize>,
-    current_down_speed: &Arc<AtomicUsize>,
-    exit_signal: &Arc<AtomicBool>,
-) -> Result<()> {
-    let agent: Agent = create_configured_agent();
-
-    let resp = match agent
-        .get(format!("{CLOUDFLARE_SPEEDTEST_DOWNLOAD_URL}&bytes={bytes_to_request}").as_str())
-        .call()
-    {
-        Ok(resp) => resp,
-        Err(err) => {
-            eprintln!("Error in download thread: {err}");
-            return Ok(());
-        }
+    let our_country = get_our_ip_address_country()?;
+    let our_country_full = locations::CCA2_TO_COUNTRY_NAME
+        .get(our_country.as_str())
+        .copied()
+        .unwrap_or("UNKNOWN");
+    let latency = get_download_server_http_latency()?;
+    let agent = create_configured_agent();
+    let server_info = get_download_server_info(&agent, CLOUDFLARE_SPEEDTEST_BASE_URL)?;
+    let server_info = if server_info.trim().is_empty() {
+        "(empty)"
+    } else {
+        server_info.trim()
     };
 
-    let body = resp.into_body();
-    let mut resp_reader = body.into_reader();
-    let mut total_bytes_sank: usize = 0;
+    logger.log(&format!("{:<32} {}", "Your Location:", our_country_full))?;
+    logger.log(&format!("{:<32} {}", "Server Info:", server_info))?;
+    logger.log(&format!(
+        "{:<32} {:.2}ms",
+        "Latency (HTTP):",
+        latency.as_millis()
+    ))?;
+    Ok(())
+}
 
-    loop {
-        // exit if we have passed deadline
-        if exit_signal.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+fn elapsed_millis(origin: Instant) -> u64 {
+    origin.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
 
-        // if we are fast, take big chunks
-        // if we are slow, take small chunks
-        let current_recv_buff =
-            get_appropriate_buff_size(current_down_speed.load(Ordering::Relaxed));
-
-        // copy bytes into the void
-        let bytes_sank = std::io::copy(
-            &mut resp_reader.by_ref().take(current_recv_buff),
-            &mut std::io::sink(),
-        )? as usize;
-
-        //println!("Thread {:?} sank {} bytes", std::thread::current().id(), bytes_sank);
-
-        if bytes_sank == 0 {
-            if total_bytes_sank == 0 {
-                eprintln!("Cloudflare sent an empty response?");
-            }
-
-            return Ok(());
-        }
-
-        total_bytes_sank += bytes_sank;
-        total_bytes_counter.fetch_add(bytes_sank, Ordering::SeqCst);
+fn run_direction_for_runtime<W: std::io::Write + Send + 'static>(
+    direction: Direction,
+    thread_count: u32,
+    requested_bytes: usize,
+    duration_seconds: u64,
+    base_url: &str,
+    logger: Arc<ThreadSafeLogger<W>>,
+) -> Result<DirectionStateSnapshot> {
+    if matches!(direction, Direction::Both) {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime runner accepts one direction at a time",
+        )));
     }
-}
 
-fn print_test_preamble() {
-    println!("{:<32} {}", "Start:", get_current_timestamp());
+    let state = Arc::new(DirectionState::default());
+    state.set_direction(direction);
+    let gate = Arc::new(RuntimeRequestGate::new());
+    let clock = Instant::now();
+    let deadline = clock
+        .checked_add(Duration::from_secs(duration_seconds))
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test duration is too large",
+            )) as Box<dyn std::error::Error>
+        })?;
+    let fatal_stop = Arc::new(AtomicBool::new(false));
+    let workers_started = Arc::new(AtomicUsize::new(0));
+    let retry_log_error = Arc::new(Mutex::new(None::<String>));
+    let base_url = base_url.trim_end_matches('/').to_owned();
 
-    let our_country = get_our_ip_address_country().expect("Couldn't get our country");
-    let our_country_full = locations::CCA2_TO_COUNTRY_NAME.get(&our_country as &str);
-    let latency = get_download_server_http_latency().expect("Couldn't get server latency");
-    let headers = get_download_server_info().expect("Couldn't get download server info");
-
-    let unknown_colo = &"???".to_owned();
-    let unknown_colo_info = &("UNKNOWN", "UNKNOWN");
-    let cf_colo = headers.get("cf-meta-colo").unwrap_or(unknown_colo);
-    let colo_info = locations::IATA_TO_CITY_COUNTRY
-        .get(cf_colo as &str)
-        .unwrap_or(unknown_colo_info);
-
-    println!(
-        "{:<32} {}",
-        "Your Location:",
-        our_country_full.unwrap_or(&"UNKNOWN")
-    );
-    println!(
-        "{:<32} {} - {}, {}",
-        "Server Location:",
-        cf_colo,
-        colo_info.0,
-        locations::CCA2_TO_COUNTRY_NAME
-            .get(colo_info.1)
-            .unwrap_or(&"UNKNOWN")
-    );
-
-    println!("{:<32} {:.2}ms\n", "Latency (HTTP):", latency.as_millis());
-}
-
-// Spawn a given amount of threads to run a specific test
-fn spawn_test_threads<F>(
-    threads_to_spawn: u32,
-    target_test: Arc<F>,
-    bytes_to_request: usize,
-    total_bytes_counter: &Arc<AtomicUsize>,
-    current_speed: &Arc<AtomicUsize>,
-    exit_signal: &Arc<AtomicBool>,
-) -> Vec<JoinHandle<()>>
-where
-    F: Fn(
-            usize,
-            &Arc<AtomicUsize>,
-            &Arc<AtomicUsize>,
-            &Arc<AtomicBool>,
-        ) -> std::result::Result<(), Box<dyn std::error::Error>>
-        + Send
-        + Sync
-        + 'static,
-{
-    let mut thread_handles = vec![];
-
-    for i in 0..threads_to_spawn {
-        let target_test_clone = Arc::clone(&target_test);
-        let total_downloaded_bytes_counter = Arc::clone(&total_bytes_counter.clone());
-        let current_down_clone = Arc::clone(&current_speed.clone());
-        let exit_signal_clone = Arc::clone(&exit_signal.clone());
-        let handle = std::thread::spawn(move || {
-            if i > 0 {
-                // sleep a little to hit a new cloudflare metal
-                // (each metal will throttle to 1 gigabit)
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (i * NEW_METAL_SLEEP_MILLIS).into(),
-                ));
+    let retry_log_error_for_callback = Arc::clone(&retry_log_error);
+    let fatal_stop_for_callback = Arc::clone(&fatal_stop);
+    let state_weak = Arc::downgrade(&state);
+    let logger_for_callback = Arc::clone(&logger);
+    state.set_retry_logger(Arc::new(move |retry_direction, delay_secs| {
+        let message = format!(
+            "{}: HTTP 429 retrying in {} second{}",
+            retry_direction.label(),
+            delay_secs,
+            if delay_secs == 1 { "" } else { "s" }
+        );
+        if let Err(error) = logger_for_callback.log(&message) {
+            let mut stored_error = retry_log_error_for_callback
+                .lock()
+                .unwrap_or_else(|_| panic!("retry log error mutex is poisoned"));
+            if stored_error.is_none() {
+                *stored_error = Some(format!("logger write failed: {error}"));
             }
+            fatal_stop_for_callback.store(true, Ordering::SeqCst);
+            if let Some(state) = state_weak.upgrade() {
+                state.stop_normally();
+            }
+        }
+    }));
+
+    if duration_seconds == 0 {
+        state.stop_normally();
+    }
+
+    let mut handles: Vec<JoinHandle<std::result::Result<(), String>>> = Vec::new();
+    for _ in 0..thread_count {
+        let state = Arc::clone(&state);
+        let gate = Arc::clone(&gate);
+        let fatal_stop = Arc::clone(&fatal_stop);
+        let workers_started = Arc::clone(&workers_started);
+        let retry_log_error = Arc::clone(&retry_log_error);
+        let base_url = base_url.clone();
+
+        handles.push(std::thread::spawn(move || {
+            if duration_seconds == 0 || state.should_stop() {
+                return Ok(());
+            }
+
+            let agent = create_configured_agent();
+            let mut first_cycle = true;
 
             loop {
-                match target_test_clone(
-                    bytes_to_request,
-                    &total_downloaded_bytes_counter,
-                    &current_down_clone,
-                    &exit_signal_clone,
-                ) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        println!("Error in download test thread {i}: {e:?}");
-                        return;
+                if fatal_stop.load(Ordering::SeqCst) || state.should_stop() {
+                    break;
+                }
+                if first_cycle {
+                    workers_started.fetch_add(1, Ordering::SeqCst);
+                    first_cycle = false;
+                } else if Instant::now() >= deadline {
+                    if workers_started.load(Ordering::SeqCst) >= thread_count as usize {
+                        state.stop_normally();
+                        break;
                     }
+                    std::thread::yield_now();
+                    continue;
                 }
 
-                // exit if we have passed the deadline
-                if exit_signal_clone.load(Ordering::Relaxed) {
-                    // println!("Thread {} exiting...", i);
-                    return;
+                let cycle_result = run_worker_cycle(
+                    &state,
+                    &gate,
+                    |meas_id| match direction {
+                        Direction::Download => {
+                            download_once(&agent, &base_url, requested_bytes, meas_id)
+                        }
+                        Direction::Upload => {
+                            upload_once(&agent, &base_url, requested_bytes, meas_id)
+                        }
+                        Direction::Both => Err(AttemptFailure::Transport),
+                    },
+                    || elapsed_millis(clock),
+                    |delay_ms| {
+                        if fatal_stop.load(Ordering::SeqCst) || state.should_stop() {
+                            return;
+                        }
+
+                        let now = Instant::now();
+                        let remaining = deadline.saturating_duration_since(now);
+                        if remaining.is_zero() {
+                            if workers_started.load(Ordering::SeqCst) >= thread_count as usize {
+                                state.stop_normally();
+                            }
+                            return;
+                        }
+
+                        let delay = Duration::from_millis(delay_ms);
+                        if delay >= remaining {
+                            std::thread::sleep(remaining);
+                            if workers_started.load(Ordering::SeqCst) >= thread_count as usize {
+                                state.stop_normally();
+                            }
+                        } else {
+                            std::thread::sleep(delay);
+                        }
+                    },
+                );
+
+                if fatal_stop.load(Ordering::SeqCst) {
+                    let error = retry_log_error
+                        .lock()
+                        .unwrap_or_else(|_| panic!("retry log error mutex is poisoned"))
+                        .clone()
+                        .unwrap_or_else(|| "fatal worker stop".to_owned());
+                    return Err(error);
+                }
+                if cycle_result.is_err() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    state.stop_normally();
+                    break;
                 }
             }
-        });
-        thread_handles.push(handle);
+
+            Ok(())
+        }));
     }
 
-    thread_handles
-}
+    if duration_seconds > 0 {
+        loop {
+            if state.should_stop() || fatal_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if handles.iter().any(|handle| handle.is_finished()) {
+                state.stop_normally();
+                break;
+            }
 
-fn run_download_test(config: &UserArgs) -> Vec<usize> {
-    let total_downloaded_bytes_counter = Arc::new(AtomicUsize::new(0));
-    let exit_signal = Arc::new(AtomicBool::new(false));
-
-    exit_signal.store(false, Ordering::SeqCst);
-    let current_down_speed = Arc::new(AtomicUsize::new(0));
-    let down_deadline = get_secs_since_unix_epoch()
-        + get_test_time(config.test_duration_seconds, config.download_threads);
-
-    let target_test = Arc::new(download_test);
-    let down_handles = spawn_test_threads(
-        config.download_threads,
-        target_test,
-        config.bytes_to_download,
-        &total_downloaded_bytes_counter,
-        &current_down_speed,
-        &exit_signal,
-    );
-
-    let mut last_bytes_down = 0;
-    total_downloaded_bytes_counter.store(0, Ordering::SeqCst);
-    let mut down_measurements = vec![];
-
-    // Calculate and print download speed
-    loop {
-        let bytes_down = total_downloaded_bytes_counter.load(Ordering::Relaxed);
-        let bytes_down_diff = bytes_down - last_bytes_down;
-
-        // set current_down
-        current_down_speed.store(bytes_down_diff, Ordering::SeqCst);
-        down_measurements.push(bytes_down_diff);
-
-        let speed_values = get_appropriate_byte_unit(bytes_down_diff as u64);
-        // only print progress if we are before deadline
-        if get_secs_since_unix_epoch() < down_deadline {
-            println!(
-                "Download: {bit_speed:>12.*}it/s       ({byte_speed:>10.*}/s)",
-                16,
-                16,
-                byte_speed = speed_values.0,
-                bit_speed = speed_values.1
-            );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if workers_started.load(Ordering::SeqCst) >= thread_count as usize {
+                    state.stop_normally();
+                    break;
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(25)));
         }
-        io::stdout().flush().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        last_bytes_down = bytes_down;
+    } else {
+        state.stop_normally();
+    }
 
-        // exit if we have passed the deadline
-        if get_secs_since_unix_epoch() > down_deadline {
-            exit_signal.store(true, Ordering::SeqCst);
-            break;
+    if !state.should_stop() {
+        state.stop_normally();
+    }
+
+    let mut join_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if join_error.is_none() {
+                    join_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if join_error.is_none() {
+                    join_error = Some("worker thread panicked".to_owned());
+                }
+            }
         }
     }
 
-    println!("Waiting for download threads to finish...");
-    for handle in down_handles {
-        handle.join().expect("Couldn't join download thread");
+    if let Some(error) = join_error {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            error,
+        )));
     }
 
-    down_measurements
-}
-
-fn run_upload_test(config: &UserArgs) -> Vec<usize> {
-    let exit_signal = Arc::new(AtomicBool::new(false));
-    let total_uploaded_bytes_counter = Arc::new(AtomicUsize::new(0));
-    let current_up_speed = Arc::new(AtomicUsize::new(0));
-    // re-use exit_signal for upload tests
-    exit_signal.store(false, Ordering::SeqCst);
-
-    let up_deadline = get_secs_since_unix_epoch()
-        + get_test_time(config.test_duration_seconds, config.upload_threads);
-
-    let target_test = Arc::new(upload_test);
-    let up_handles = spawn_test_threads(
-        config.upload_threads,
-        target_test,
-        config.bytes_to_upload,
-        &total_uploaded_bytes_counter,
-        &current_up_speed,
-        &exit_signal,
-    );
-
-    let mut last_bytes_up = 0;
-    let mut up_measurements = vec![];
-    total_uploaded_bytes_counter.store(0, Ordering::SeqCst);
-
-    // Calculate and print upload speed
-    loop {
-        let bytes_up = total_uploaded_bytes_counter.load(Ordering::Relaxed);
-
-        let bytes_up_diff = bytes_up - last_bytes_up;
-        up_measurements.push(bytes_up_diff);
-
-        let speed_values = get_appropriate_byte_unit(bytes_up_diff as u64);
-
-        println!(
-            "Upload:   {bit_speed:>12.*}it/s       ({byte_speed:>10.*}/s)",
-            16,
-            16,
-            byte_speed = speed_values.0,
-            bit_speed = speed_values.1
-        );
-
-        io::stdout().flush().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        last_bytes_up = bytes_up;
-
-        // exit if we have passed the deadline
-        if get_secs_since_unix_epoch() > up_deadline {
-            exit_signal.store(true, Ordering::SeqCst);
-            break;
-        }
-    }
-
-    // wait for upload threads to finish
-    println!("Waiting for upload threads to finish...");
-    for handle in up_handles {
-        handle.join().expect("Couldn't join upload thread");
-    }
-
-    up_measurements
+    Ok(state.snapshot())
 }
 
 fn compute_statistics(data: &mut [usize]) -> (f64, f64, usize, usize, usize, usize) {
@@ -1132,27 +1237,110 @@ fn compute_statistics(data: &mut [usize]) -> (f64, f64, usize, usize, usize, usi
     (median, average, data[p90_index], data[p99_index], min, max)
 }
 
-fn main() {
-    let config: UserArgs = argh::from_env();
-    config.validate().expect("Invalid arguments");
+fn requested_missing_direction(
+    direction: Direction,
+    download_snapshot: &DirectionStateSnapshot,
+    upload_snapshot: &DirectionStateSnapshot,
+) -> Option<&'static str> {
+    match direction {
+        Direction::Download if download_snapshot.valid_sample_count == 0 => Some("download"),
+        Direction::Upload if upload_snapshot.valid_sample_count == 0 => Some("upload"),
+        Direction::Both if download_snapshot.valid_sample_count == 0 => Some("download"),
+        Direction::Both if upload_snapshot.valid_sample_count == 0 => Some("upload"),
+        _ => None,
+    }
+}
 
-    print_test_preamble();
+fn requested_terminal_failure<'a>(
+    direction: Direction,
+    download_snapshot: &'a DirectionStateSnapshot,
+    upload_snapshot: &'a DirectionStateSnapshot,
+) -> Option<(&'static str, &'a AttemptFailure)> {
+    match direction {
+        Direction::Download => download_snapshot
+            .terminal_error
+            .as_ref()
+            .map(|failure| ("download", failure)),
+        Direction::Upload => upload_snapshot
+            .terminal_error
+            .as_ref()
+            .map(|failure| ("upload", failure)),
+        Direction::Both => download_snapshot
+            .terminal_error
+            .as_ref()
+            .map(|failure| ("download", failure))
+            .or_else(|| {
+                upload_snapshot
+                    .terminal_error
+                    .as_ref()
+                    .map(|failure| ("upload", failure))
+            }),
+    }
+}
 
-    let mut down_measurements: Vec<usize> = Vec::new();
-    let mut up_measurements: Vec<usize> = Vec::new();
-
-    if !config.upload_only {
-        down_measurements = run_download_test(&config);
+fn run_program<W: std::io::Write + Send>(
+    args: &UserArgs,
+    download_snapshot: &DirectionStateSnapshot,
+    upload_snapshot: &DirectionStateSnapshot,
+    logger: &ThreadSafeLogger<W>,
+) -> i32 {
+    if let Err(error) = args.validate() {
+        return if logger.log(&format!("ERROR: {error}")).is_ok() {
+            2
+        } else {
+            1
+        };
     }
 
-    if !config.download_only {
-        println!("Starting upload tests...");
-        up_measurements = run_upload_test(&config);
+    let direction = Direction::from_args(args);
+    if let Some(missing_direction) =
+        requested_missing_direction(direction, download_snapshot, upload_snapshot)
+    {
+        return if logger
+            .log(&format!("ERROR: no valid {missing_direction} samples"))
+            .is_ok()
+        {
+            3
+        } else {
+            1
+        };
     }
+
+    if let Some((failed_direction, failure)) =
+        requested_terminal_failure(direction, download_snapshot, upload_snapshot)
+    {
+        return if logger
+            .log(&format!(
+                "ERROR: {failed_direction} transfer failed: {failure}"
+            ))
+            .is_ok()
+        {
+            1
+        } else {
+            1
+        };
+    }
+
+    let mut download_rates: Vec<usize> = match direction {
+        Direction::Download | Direction::Both => download_snapshot
+            .measurements
+            .iter()
+            .map(|sample| sample.bytes_per_second)
+            .collect(),
+        Direction::Upload => Vec::new(),
+    };
+    let mut upload_rates: Vec<usize> = match direction {
+        Direction::Upload | Direction::Both => upload_snapshot
+            .measurements
+            .iter()
+            .map(|sample| sample.bytes_per_second)
+            .collect(),
+        Direction::Download => Vec::new(),
+    };
 
     let (download_median, download_avg, download_p90, _, _, _) =
-        compute_statistics(&mut down_measurements);
-    let (upload_median, upload_avg, upload_p90, _, _, _) = compute_statistics(&mut up_measurements);
+        compute_statistics(&mut download_rates);
+    let (upload_median, upload_avg, upload_p90, _, _, _) = compute_statistics(&mut upload_rates);
 
     let mut table = Table::new();
     table
@@ -1165,14 +1353,12 @@ fn main() {
             Cell::new("90th pctile"),
         ]);
 
-    // Populate rows based on computed statistics
     table.add_row(vec![
         Cell::new("DOWN"),
         Cell::new(get_appropriate_byte_unit_rate(download_median as u64).1),
         Cell::new(get_appropriate_byte_unit_rate(download_avg as u64).1),
         Cell::new(get_appropriate_byte_unit_rate(download_p90 as u64).1),
     ]);
-
     table.add_row(vec![
         Cell::new("UP"),
         Cell::new(get_appropriate_byte_unit_rate(upload_median as u64).1),
@@ -1180,5 +1366,134 @@ fn main() {
         Cell::new(get_appropriate_byte_unit_rate(upload_p90 as u64).1),
     ]);
 
-    print!("\n{}\n{}\n", get_current_timestamp(), table);
+    let table_text = table.to_string();
+    if logger.log(&table_text).is_ok() {
+        0
+    } else {
+        1
+    }
+}
+
+fn parse_command_line<W: std::io::Write + Send>(
+    logger: &ThreadSafeLogger<W>,
+) -> std::result::Result<UserArgs, i32> {
+    let raw_arguments: Vec<_> = std::env::args_os().collect();
+    let mut arguments = Vec::with_capacity(raw_arguments.len());
+    for argument in raw_arguments {
+        match argument.into_string() {
+            Ok(argument) => arguments.push(argument),
+            Err(_) => {
+                if logger
+                    .log("ERROR: invalid UTF-8 command-line argument")
+                    .is_err()
+                {
+                    return Err(1);
+                }
+                return Err(2);
+            }
+        }
+    }
+
+    if arguments.is_empty() {
+        if logger.log("ERROR: command name is missing").is_err() {
+            return Err(1);
+        }
+        return Err(2);
+    }
+
+    let command_name = arguments[0].as_str();
+    let argument_refs: Vec<&str> = arguments[1..].iter().map(String::as_str).collect();
+    match UserArgs::from_args(&[command_name], &argument_refs) {
+        Ok(args) => Ok(args),
+        Err(early_exit) => {
+            let status = if early_exit.status.is_ok() { 0 } else { 2 };
+            let message = if status == 0 {
+                early_exit.output
+            } else {
+                format!(
+                    "ERROR: {}\nRun {} --help for more information.",
+                    early_exit.output.trim_end(),
+                    command_name
+                )
+            };
+            if logger.log(&message).is_err() {
+                Err(1)
+            } else {
+                Err(status)
+            }
+        }
+    }
+}
+
+fn run_main<W: std::io::Write + Send + 'static>(logger: Arc<ThreadSafeLogger<W>>) -> i32 {
+    let config = match parse_command_line(&logger) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+
+    if let Err(error) = config.validate() {
+        return if logger.log(&format!("ERROR: {error}")).is_ok() {
+            2
+        } else {
+            1
+        };
+    }
+
+    if let Err(error) = print_test_preamble(&logger) {
+        let _ = logger.log(&format!("ERROR: preamble failed: {error}"));
+        return 1;
+    }
+
+    let direction = Direction::from_args(&config);
+    let mut download_snapshot = DirectionStateSnapshot::default();
+    let mut upload_snapshot = DirectionStateSnapshot::default();
+
+    if matches!(direction, Direction::Download | Direction::Both) {
+        if logger.log("Starting download tests...").is_err() {
+            return 1;
+        }
+        match run_direction_for_runtime(
+            Direction::Download,
+            config.download_threads,
+            config.bytes_to_download,
+            config.test_duration_seconds,
+            CLOUDFLARE_SPEEDTEST_BASE_URL,
+            Arc::clone(&logger),
+        ) {
+            Ok(snapshot) => download_snapshot = snapshot,
+            Err(error) => {
+                let _ = logger.log(&format!("ERROR: download runtime failed: {error}"));
+                return 1;
+            }
+        }
+    }
+
+    if matches!(direction, Direction::Upload | Direction::Both) {
+        if logger.log("Starting upload tests...").is_err() {
+            return 1;
+        }
+        match run_direction_for_runtime(
+            Direction::Upload,
+            config.upload_threads,
+            config.bytes_to_upload,
+            config.test_duration_seconds,
+            CLOUDFLARE_SPEEDTEST_BASE_URL,
+            Arc::clone(&logger),
+        ) {
+            Ok(snapshot) => upload_snapshot = snapshot,
+            Err(error) => {
+                let _ = logger.log(&format!("ERROR: upload runtime failed: {error}"));
+                return 1;
+            }
+        }
+    }
+
+    run_program(&config, &download_snapshot, &upload_snapshot, &logger)
+}
+
+fn main() -> std::process::ExitCode {
+    let logger = Arc::new(ThreadSafeLogger::new(Arc::new(Mutex::new(
+        std::io::stdout(),
+    ))));
+    std::process::ExitCode::from(run_main(logger) as u8)
 }
