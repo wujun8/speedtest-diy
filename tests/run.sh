@@ -93,8 +93,8 @@ portability_contract() {
 
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
-    local metadata_step metadata_input shell_step image_step url_step only_down_step empty_proxy_step initial_step sigterm_step
-    local shell_input image_input url_input only_down_input empty_proxy_input initial_input sigterm_input
+    local metadata_step metadata_input shell_step image_step hardened_step url_step only_down_step empty_proxy_step initial_step sigterm_step
+    local shell_input image_input hardened_input url_input only_down_input empty_proxy_input initial_input sigterm_input
     require_file "$file" || return 1
 
     require_line "$file" 'name: container' 'workflow name' || return 1
@@ -124,7 +124,7 @@ workflow_contract() {
 
     shell_step=$(extract_step "$file" test 'Shell syntax checks')
     require_line <(printf '%s\n' "$shell_step") \
-        'run: bash -n random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh' \
+        'run: bash -n runtime-log.sh random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_runtime_log.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh' \
         'shell syntax list includes network runtime files' || return 1
 
     image_step=$(extract_step "$file" build-and-smoke 'Run image smoke checks')
@@ -133,6 +133,9 @@ workflow_contract() {
         'built-image smoke invocation' || return 1
     require_line "$image_input" 'test -x /usr/local/bin/random-wait.sh' 'random helper executable smoke' || return 1
     require_line "$image_input" 'test -x /usr/local/bin/network-runtime.sh' 'network helper executable smoke' || return 1
+    require_line "$image_input" 'test -x /usr/local/bin/runtime-log.sh' 'runtime logger executable smoke' || return 1
+    require_line "$image_input" 'test -s /usr/share/doc/cf_speedtest/LICENSE.txt' 'cf_speedtest license smoke' || return 1
+    require_line "$image_input" 'test -s /usr/share/doc/cf_speedtest/UPSTREAM.json' 'cf_speedtest provenance smoke' || return 1
     require_line "$image_input" 'test -x "$(command -v curl)"' 'curl executable smoke' || return 1
     require_line "$image_input" 'test -s /etc/ssl/certs/ca-certificates.crt' 'CA bundle smoke' || return 1
     require_line "$image_input" "RANDOM_WAIT_PATCH_MARKER: validated random interval seam" 'patched marker smoke' || return 1
@@ -142,6 +145,23 @@ workflow_contract() {
     require_line "$image_input" 'run_cf_speedtest_proxy' 'proxy speedtest marker smoke' || return 1
     require_line "$image_input" 'help_output=$(cf_speedtest --help 2>&1)' 'pinned cf help invocation' || return 1
     require_line "$image_input" "grep -Fq -- '--download-only' <<<\"\$help_output\"" 'download-only help assertion' || return 1
+    require_line "$image_input" "grep -Fq -- '--bytes-to-download' <<<\"\$help_output\"" 'download bytes help assertion' || return 1
+    require_line "$image_input" "grep -Fq -- '--bytes-to-upload' <<<\"\$help_output\"" 'upload bytes help assertion' || return 1
+
+    hardened_step=$(extract_step "$file" build-and-smoke 'Hardened cf_speedtest CLI smoke')
+    hardened_input=$(printf '%s\n' "$hardened_step")
+    require_line "$hardened_input" 'timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$IMAGE" --help' 'bounded hardened help smoke' || return 1
+    require_line "$hardened_input" '--download-threads 0' 'hardened invalid thread smoke' || return 1
+    require_line "$hardened_input" '[ "$invalid_rc" -eq 2 ]' 'hardened invalid exit code' || return 1
+    require_line "$hardened_input" '--download-only --test-duration-seconds 0' 'hardened zero-sample smoke' || return 1
+    require_line "$hardened_input" '[ "$zero_rc" -eq 3 ]' 'hardened zero-sample exit code' || return 1
+    require_line "$hardened_input" 'ERROR: no valid download samples' 'hardened zero-sample diagnosis' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$help_output"' 'hardened help timestamp check' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$invalid_output"' 'hardened invalid timestamp check' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$zero_output"' 'hardened zero-sample timestamp check' || return 1
+    require_line "$hardened_input" "grep -Fq -- '--bytes-to-download'" 'hardened download bytes help check' || return 1
+    require_line "$hardened_input" "grep -Fq -- '--bytes-to-upload'" 'hardened upload bytes help check' || return 1
+    require_line "$hardened_input" 'unexpected success table' 'hardened failure table prohibition' || return 1
 
     url_step=$(extract_step "$file" build-and-smoke 'Direct URL download smoke')
     url_input=$(printf '%s\n' "$url_step")
@@ -165,7 +185,8 @@ workflow_contract() {
     require_line "$url_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$url_container"' 'built-image URL stopped-state check' || return 1
     require_line "$url_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$url_container"' 'built-image URL exit-code check' || return 1
     require_line "$url_input" 'url_logs=$(docker logs "$url_container" 2>&1 || true)' 'built-image URL post-stop log reread' || return 1
-    require_line "$url_input" 'grep -Fxc -- "$summary" <<<"$url_logs"' 'single-line URL summary assertion' || return 1
+    require_line "$url_input" 'grep -Fc -- "$summary" <<<"$url_logs"' 'timestamp-safe URL summary assertion' || return 1
+    require_line "$url_input" 'assert_timestamped_logs "$url_logs"' 'URL log timestamp assertion' || return 1
     if grep -Fq -- '-e WAIT_TIME=1' <<<"$url_input"; then
         printf 'FAIL: built-image URL smoke still uses WAIT_TIME=1\n' >&2
         return 1
@@ -211,6 +232,7 @@ workflow_contract() {
     require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$only_down_container")" = false ]' 'download-only stopped-state assertion' || return 1
     require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$only_down_container")" = 0 ]' 'download-only exit code assertion' || return 1
     require_line "$only_down_input" 'only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)' 'download-only post-stop log reread' || return 1
+    require_line "$only_down_input" 'assert_timestamped_logs "$only_down_logs"' 'download-only timestamp assertion' || return 1
     require_line "$only_down_input" 'Stop requested. Cleaning up and exiting...' 'download-only English shutdown assertion' || return 1
     require_line "$only_down_input" 'Arrêt du script demandé.' 'French shutdown prohibition' || return 1
     require_line "$only_down_input" 'rm -rf -- "$fake_root"' 'download-only fake trap cleanup' || return 1
@@ -231,6 +253,7 @@ workflow_contract() {
     require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$empty_proxy_container")" = false ]' 'empty-proxy stopped-state assertion' || return 1
     require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$empty_proxy_container")" = 0 ]' 'empty-proxy exit code assertion' || return 1
     require_line "$empty_proxy_input" 'Stop requested. Cleaning up and exiting...' 'empty-proxy English shutdown assertion' || return 1
+    require_line "$empty_proxy_input" 'assert_timestamped_logs "$empty_proxy_logs"' 'empty-proxy timestamp assertion' || return 1
     require_line "$empty_proxy_input" 'rm -rf -- "$empty_proxy_root"' 'empty-proxy fake trap cleanup' || return 1
 
     sigterm_step=$(extract_step "$file" build-and-smoke 'Verify SIGTERM shutdown')
@@ -253,6 +276,7 @@ workflow_contract() {
     require_line "$sigterm_input" 'Stop requested. Cleaning up and exiting...' 'English shutdown log assertion' || return 1
     require_line "$sigterm_input" 'timeout 10s docker stop --time 5' 'bounded SIGTERM smoke' || return 1
     require_line "$sigterm_input" 'logs=$(docker logs "$container_id" 2>&1 || true)' 'post-stop Docker log reread' || return 1
+    require_line "$sigterm_input" 'assert_timestamped_logs "$logs"' 'default lifecycle timestamp assertion' || return 1
     require_line "$sigterm_input" "docker inspect -f '{{.State.Running}}' \"\$container_id\"" 'post-stop State.Running check' || return 1
     require_line "$sigterm_input" "docker inspect -f '{{.State.ExitCode}}' \"\$container_id\"" 'post-stop ExitCode check' || return 1
     require_line "$sigterm_input" '= false ]' 'post-stop stopped-state assertion' || return 1
@@ -267,6 +291,7 @@ workflow_contract() {
     require_line "$initial_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$initial_container"' 'initial-wait stopped-state assertion' || return 1
     require_line "$initial_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$initial_container")" = 0 ]' 'initial-wait exit code assertion' || return 1
     require_line "$initial_input" 'initial_logs=$(docker logs "$initial_container" 2>&1 || true)' 'initial-wait post-stop log reread' || return 1
+    require_line "$initial_input" 'assert_timestamped_logs "$initial_logs"' 'initial-wait timestamp assertion' || return 1
     require_line "$initial_input" 'Stop requested. Cleaning up and exiting...' 'initial-wait English shutdown' || return 1
     require_line "$initial_input" 'docker rm -f "$initial_container"' 'initial-wait minimal cleanup' || return 1
 }
@@ -327,6 +352,9 @@ anonymous_ghcr_contract() {
     require_line "$public_input" 'sha_id=$(docker image inspect --format '\''{{.Id}}'\'' "$sha_image")' 'public SHA image inspection' || return 1
     require_line "$public_input" 'docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$sha_image" -c' 'public SHA helper inspection invocation' || return 1
     require_line "$public_input" 'test -x /usr/local/bin/network-runtime.sh' 'public network helper inspection' || return 1
+    require_line "$public_input" 'test -x /usr/local/bin/runtime-log.sh' 'public runtime logger inspection' || return 1
+    require_line "$public_input" 'test -s /usr/share/doc/cf_speedtest/LICENSE.txt' 'public cf license inspection' || return 1
+    require_line "$public_input" 'test -s /usr/share/doc/cf_speedtest/UPSTREAM.json' 'public cf provenance inspection' || return 1
     require_line "$public_input" 'test -x "$(command -v curl)"' 'public curl inspection' || return 1
     require_line "$public_input" 'test -s /etc/ssl/certs/ca-certificates.crt' 'public CA inspection' || return 1
     require_line "$public_input" 'sha_url_container="speedtest-diy-published-sha-url-${GITHUB_RUN_ID:-local}"' 'named published SHA URL container' || return 1
@@ -350,7 +378,13 @@ anonymous_ghcr_contract() {
     require_line "$public_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$sha_url_container"' 'public URL stopped-state assertion' || return 1
     require_line "$public_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$sha_url_container"' 'public URL exit-code assertion' || return 1
     require_line "$public_input" 'sha_url_logs=$(docker logs "$sha_url_container" 2>&1 || true)' 'public URL post-stop log reread' || return 1
-    require_line "$public_input" 'grep -Fxc -- "$summary" <<<"$sha_url_logs"' 'public one-line summary assertion' || return 1
+    require_line "$public_input" 'grep -Fc -- "$summary" <<<"$sha_url_logs"' 'public timestamp-safe summary assertion' || return 1
+    require_line "$public_input" 'timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$sha_image" --help' 'public hardened binary help smoke' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$public_help"' 'public help timestamp assertion' || return 1
+    require_line "$public_input" "grep -Fq -- '--bytes-to-download' <<<\"\$public_help\"" 'public download bytes help assertion' || return 1
+    require_line "$public_input" "grep -Fq -- '--bytes-to-upload' <<<\"\$public_help\"" 'public upload bytes help assertion' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$sha_logs"' 'public idle log timestamp assertion' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$sha_url_logs"' 'public URL log timestamp assertion' || return 1
     require_line "$public_input" 'grep -Fq -- "$sha_url" <<<"$sha_url_logs"' 'public URL redaction assertion' || return 1
     require_line "$public_input" "'saved'" 'public progress noise assertion' || return 1
     require_line "$public_input" "'%'" 'public percentage progress noise assertion' || return 1
@@ -375,6 +409,7 @@ anonymous_ghcr_contract() {
         printf 'FAIL: anonymous GHCR job performs a registry login\n' >&2
         return 1
     fi
+    require_no_line "$file" 'speed.cloudflare.com' 'workflow live Cloudflare speed test prohibition' || return 1
 }
 
 dockerfile_contract() {
