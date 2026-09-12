@@ -625,7 +625,7 @@ data = json.loads(path.read_text(encoding="utf-8"))
 assert data.get("receipt_scope") == "pre-change upstream bytes", data.get("receipt_scope")
 assert "files" not in data, "ambiguous top-level files receipt key remains"
 receipts = data.get("upstream_file_receipts_before_local_changes")
-assert isinstance(receipts, dict) and len(receipts) == 8, receipts
+assert isinstance(receipts, dict) and len(receipts) == 9, receipts
 assert data.get("locally_modified_files") == [
     "src/args.rs",
     "src/main.rs",
