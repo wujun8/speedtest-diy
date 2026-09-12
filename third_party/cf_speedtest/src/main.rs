@@ -157,11 +157,21 @@ impl RuntimeRequestGate {
         state.retry_deadline_ms = state.retry_deadline_ms.max(deadline_ms);
     }
 
-    fn wait_for_start_with<N, S>(&self, mut now_ms: N, mut sleeper: S) -> u64
+    fn wait_for_start_with_cancel<N, S, C>(
+        &self,
+        mut now_ms: N,
+        mut sleeper: S,
+        mut cancel: C,
+    ) -> Option<u64>
     where
         N: FnMut() -> u64,
         S: FnMut(u64),
+        C: FnMut() -> bool,
     {
+        if cancel() {
+            return None;
+        }
+
         let (mut reserved_start_ms, mut observed_retry_deadline_ms) = {
             let mut state = self.lock_state();
             let retry_deadline_ms = state.retry_deadline_ms;
@@ -171,6 +181,10 @@ impl RuntimeRequestGate {
         };
 
         loop {
+            if cancel() {
+                return None;
+            }
+
             let now = now_ms();
             let mut state = self.lock_state();
             if state.retry_deadline_ms > observed_retry_deadline_ms {
@@ -186,13 +200,32 @@ impl RuntimeRequestGate {
                 state.next_start_ms = state
                     .next_start_ms
                     .max(actual_start_ms.saturating_add(REQUEST_START_SPACING_MS));
-                return actual_start_ms;
+                drop(state);
+                if cancel() {
+                    return None;
+                }
+                return Some(actual_start_ms);
             }
 
             let delay_ms = reserved_start_ms - now;
             drop(state);
+            if cancel() {
+                return None;
+            }
             sleeper(delay_ms);
+            if cancel() {
+                return None;
+            }
         }
+    }
+
+    fn wait_for_start_with<N, S>(&self, now_ms: N, sleeper: S) -> u64
+    where
+        N: FnMut() -> u64,
+        S: FnMut(u64),
+    {
+        self.wait_for_start_with_cancel(now_ms, sleeper, || false)
+            .expect("uncancellable runtime request gate wait must return a start")
     }
 }
 
@@ -563,6 +596,9 @@ impl<W: std::io::Write + Send> ThreadSafeLogger<W> {
             std::io::Error::new(std::io::ErrorKind::Other, "logger writer mutex is poisoned")
         })?;
         writer.write_all(formatted.as_bytes())?;
+        if !formatted.ends_with('\n') {
+            writer.write_all(b"\n")?;
+        }
         writer.flush()
     }
 
@@ -683,7 +719,11 @@ where
             return Ok(());
         }
 
-        gate.wait_for_start_with(&mut now_ms, &mut sleeper);
+        let Some(_) =
+            gate.wait_for_start_with_cancel(&mut now_ms, &mut sleeper, || state.should_stop())
+        else {
+            return Ok(());
+        };
         if state.should_stop() {
             return Ok(());
         }
@@ -995,6 +1035,10 @@ fn print_test_preamble<W: std::io::Write + Send>(logger: &ThreadSafeLogger<W>) -
         latency.as_millis()
     ))?;
     Ok(())
+}
+
+fn should_run_network_preamble(args: &UserArgs) -> bool {
+    args.test_duration_seconds > 0
 }
 
 fn elapsed_millis(origin: Instant) -> u64 {
@@ -1437,6 +1481,12 @@ fn run_main<W: std::io::Write + Send + 'static>(logger: Arc<ThreadSafeLogger<W>>
         } else {
             1
         };
+    }
+
+    if !should_run_network_preamble(&config) {
+        let download_snapshot = DirectionStateSnapshot::default();
+        let upload_snapshot = DirectionStateSnapshot::default();
+        return run_program(&config, &download_snapshot, &upload_snapshot, &logger);
     }
 
     if let Err(error) = print_test_preamble(&logger) {
