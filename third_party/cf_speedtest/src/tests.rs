@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1247,6 +1247,106 @@ fn timestamped_logger_keeps_concurrent_multiline_calls_as_whole_blocks() {
             || rendered == format!("{expected_b}{expected_a}"),
         "concurrent log calls must not interleave physical lines: {rendered:?}"
     );
+}
+
+#[test]
+fn timestamped_logger_terminates_sequential_calls_with_newlines() {
+    let (output, logger) = test_logger();
+    let first_timestamp = test_timestamp("2026-09-12T01:02:03.456Z");
+    let second_timestamp = test_timestamp("2026-09-12T01:02:04.456Z");
+    let first_prefix = "[2026-09-12T01:02:03.456Z] ";
+    let second_prefix = "[2026-09-12T01:02:04.456Z] ";
+
+    logger
+        .log_at(first_timestamp, "first\nfirst-tail")
+        .unwrap();
+    logger.log_at(second_timestamp, "second").unwrap();
+
+    let rendered = test_output_text(&output);
+    assert_eq!(
+        rendered.lines().collect::<Vec<_>>(),
+        vec![
+            "[2026-09-12T01:02:03.456Z] first",
+            "[2026-09-12T01:02:03.456Z] first-tail",
+            "[2026-09-12T01:02:04.456Z] second",
+        ]
+    );
+    assert!(rendered.ends_with('\n'));
+    assert!(rendered.lines().all(|line| {
+        line.matches(first_prefix).count() + line.matches(second_prefix).count() == 1
+    }));
+    assert!(rendered.contains("[2026-09-12T01:02:03.456Z] first\n"));
+    assert!(rendered.contains("[2026-09-12T01:02:04.456Z] second\n"));
+    assert!(!rendered.contains("first[2026-09-12T01:02:04.456Z] second"));
+}
+
+#[test]
+fn cancelled_runtime_gate_wait_returns_without_issuing_request_or_spinning() {
+    let gate = Arc::new(RuntimeRequestGate::new());
+    let first_start = gate.wait_for_start_with(|| 0, |_| {});
+    assert_eq!(first_start, 0);
+
+    let state = Arc::new(DirectionState::default());
+    let now_ms = Arc::new(AtomicU64::new(0));
+    let sleep_count = Arc::new(AtomicUsize::new(0));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let (done_sender, done_receiver) = std::sync::mpsc::sync_channel(1);
+
+    let gate_for_worker = Arc::clone(&gate);
+    let state_for_worker = Arc::clone(&state);
+    let now_for_worker = Arc::clone(&now_ms);
+    let sleep_count_for_worker = Arc::clone(&sleep_count);
+    let request_count_for_worker = Arc::clone(&request_count);
+    let worker = std::thread::spawn(move || {
+        let mut now = || now_for_worker.load(Ordering::SeqCst);
+        let state_for_sleeper = Arc::clone(&state_for_worker);
+        let sleep_count_for_sleeper = Arc::clone(&sleep_count_for_worker);
+        let mut sleeper = move |_delay_ms: u64| {
+            if sleep_count_for_sleeper.fetch_add(1, Ordering::SeqCst) == 0 {
+                state_for_sleeper.stop_normally();
+            }
+            // Deliberately do not advance virtual time: cancellation must win.
+        };
+        let state_for_cancel = Arc::clone(&state_for_worker);
+        let mut cancel = move || state_for_cancel.should_stop();
+
+        let reserved_start = gate_for_worker.wait_for_start_with_cancel(
+            &mut now,
+            &mut sleeper,
+            &mut cancel,
+        );
+        if reserved_start.is_some() {
+            request_count_for_worker.fetch_add(1, Ordering::SeqCst);
+        }
+        done_sender
+            .send(reserved_start)
+            .expect("cancellation result receiver must remain available");
+    });
+
+    let reserved_start = match done_receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(reserved_start) => reserved_start,
+        Err(error) => {
+            drop(worker);
+            panic!("cancelled gate wait must return promptly: {error}");
+        }
+    };
+    worker
+        .join()
+        .expect("cancelled gate worker thread must finish");
+
+    assert_eq!(reserved_start, None);
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    assert_eq!(sleep_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn zero_duration_skips_network_preamble_but_positive_duration_runs_it() {
+    let mut args = UserArgs::default();
+    args.test_duration_seconds = 0;
+    assert!(!should_run_network_preamble(&args));
+
+    args.test_duration_seconds = 1;
+    assert!(should_run_network_preamble(&args));
 }
 
 #[test]
