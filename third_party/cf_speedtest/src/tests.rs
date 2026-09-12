@@ -1,9 +1,12 @@
 use super::*;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const TEN_MEBIBYTES: usize = 10485760;
 
@@ -335,4 +338,496 @@ fn test_get_appropriate_byte_unit() {
         get_appropriate_byte_unit(1024 * 1024 * 1024 * 1024 * 1024),
         ("1024.00 TB".to_string(), "8.19 pb".to_string())
     );
+}
+
+const LOCAL_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_HTTP_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
+
+struct RecordedHttpRequest {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl RecordedHttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn query_value(&self, name: &str) -> Option<&str> {
+        let query = self.target.split_once('?')?.1;
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == name).then_some(value)
+        })
+    }
+}
+
+struct LocalHttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn local_http_response(status: u16, body: &[u8], retry_after: Option<&str>) -> LocalHttpResponse {
+    let mut headers = Vec::new();
+    if let Some(retry_after) = retry_after {
+        headers.push(("Retry-After".to_string(), retry_after.to_string()));
+    }
+
+    LocalHttpResponse {
+        status,
+        headers,
+        body: body.to_vec(),
+    }
+}
+
+struct LocalHttpServer {
+    base_url: String,
+    join_handle: Option<JoinHandle<Vec<RecordedHttpRequest>>>,
+}
+
+impl LocalHttpServer {
+    fn finish(mut self) -> Vec<RecordedHttpRequest> {
+        self.join_handle
+            .take()
+            .expect("local HTTP server join handle must exist")
+            .join()
+            .expect("local HTTP server thread must finish")
+    }
+}
+
+impl Drop for LocalHttpServer {
+    fn drop(&mut self) {
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+fn spawn_local_http_server<F>(
+    expected_connections: usize,
+    response_for: F,
+) -> LocalHttpServer
+where
+    F: Fn(usize, &RecordedHttpRequest) -> LocalHttpResponse + Send + 'static,
+{
+    assert!(expected_connections > 0);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    listener
+        .set_nonblocking(true)
+        .expect("configure loopback listener polling");
+    let base_url = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("read loopback listener address").port()
+    );
+
+    let join_handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_ACCEPT_TIMEOUT;
+        let mut requests = Vec::with_capacity(expected_connections);
+
+        for connection_index in 0..expected_connections {
+            let mut stream = accept_local_http_connection(&listener, deadline);
+            stream
+                .set_read_timeout(Some(LOCAL_HTTP_SOCKET_TIMEOUT))
+                .expect("set local HTTP read timeout");
+            stream
+                .set_write_timeout(Some(LOCAL_HTTP_SOCKET_TIMEOUT))
+                .expect("set local HTTP write timeout");
+
+            let request = read_local_http_request(&mut stream);
+            let response = response_for(connection_index, &request);
+            write_local_http_response(&mut stream, response);
+            requests.push(request);
+        }
+
+        assert_eq!(
+            requests.len(),
+            expected_connections,
+            "local HTTP server must observe the exact connection count"
+        );
+        requests
+    });
+
+    LocalHttpServer {
+        base_url,
+        join_handle: Some(join_handle),
+    }
+}
+
+fn accept_local_http_connection(listener: &TcpListener, deadline: Instant) -> TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _peer)) => return stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for local HTTP connection");
+                }
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("local HTTP accept failed: {error}"),
+        }
+    }
+}
+
+fn read_local_http_request(stream: &mut TcpStream) -> RecordedHttpRequest {
+    let mut raw_request = Vec::new();
+    let header_end = loop {
+        if let Some(header_start) = raw_request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            break header_start + 4;
+        }
+
+        let mut chunk = [0u8; 4096];
+        let read = stream
+            .read(&mut chunk)
+            .expect("read local HTTP request headers");
+        if read == 0 {
+            panic!("local HTTP peer closed before request headers");
+        }
+        raw_request.extend_from_slice(&chunk[..read]);
+        assert!(
+            raw_request.len() <= LOCAL_HTTP_MAX_HEADER_BYTES,
+            "local HTTP request headers must remain bounded"
+        );
+    };
+
+    let header_text = std::str::from_utf8(&raw_request[..header_end - 4])
+        .expect("local HTTP request headers must be UTF-8");
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().expect("local HTTP request line");
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .expect("local HTTP request method")
+        .to_string();
+    let target = request_parts
+        .next()
+        .expect("local HTTP request target")
+        .to_string();
+
+    let headers = lines
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, value) = line
+                .split_once(':')
+                .expect("local HTTP header must contain a colon");
+            (name.to_ascii_lowercase(), value.trim().to_string())
+        })
+        .collect::<Vec<_>>();
+
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .map(|(_, value)| {
+            value
+                .parse::<usize>()
+                .expect("local HTTP Content-Length must be an integer")
+        })
+        .unwrap_or(0);
+
+    let mut body = raw_request[header_end..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let read = stream
+            .read(&mut chunk)
+            .expect("read local HTTP request body");
+        if read == 0 {
+            panic!("local HTTP peer closed before Content-Length bytes");
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+
+    RecordedHttpRequest {
+        method,
+        target,
+        headers,
+        body,
+    }
+}
+
+fn write_local_http_response(stream: &mut TcpStream, response: LocalHttpResponse) {
+    let reason = match response.status {
+        200 => "OK",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
+        _ => "Test Response",
+    };
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        reason,
+        response.body.len()
+    );
+    for (name, value) in response.headers {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+
+    stream
+        .write_all(head.as_bytes())
+        .expect("write local HTTP response headers");
+    stream
+        .write_all(&response.body)
+        .expect("write local HTTP response body");
+    stream.flush().expect("flush local HTTP response");
+}
+
+fn local_http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(true)
+        .proxy(None)
+        .timeout_global(Some(LOCAL_HTTP_SOCKET_TIMEOUT))
+        .build()
+        .into()
+}
+
+#[test]
+fn execute_with_retry_uses_new_ids_and_retry_after_then_fallback_delays() {
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_ids = Arc::new(Mutex::new(Vec::new()));
+    let sleep_log = Arc::new(Mutex::new(Vec::new()));
+
+    let attempt_count_for_closure = Arc::clone(&attempt_count);
+    let attempt_ids_for_closure = Arc::clone(&attempt_ids);
+    let sleep_log_for_closure = Arc::clone(&sleep_log);
+    let result = execute_with_retry(
+        RetryPolicy::default(),
+        move |meas_id| {
+            attempt_ids_for_closure.lock().unwrap().push(meas_id);
+            match attempt_count_for_closure.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(AttemptFailure::RateLimited(Some("1".to_string()))),
+                1 => Err(AttemptFailure::RateLimited(None)),
+                2 => Ok(TransferSample {
+                    bytes: 4,
+                    bytes_per_second: 4,
+                }),
+                _ => panic!("retry state machine must not perform a fourth attempt"),
+            }
+        },
+        move |delay_secs| {
+            sleep_log_for_closure.lock().unwrap().push(delay_secs);
+        },
+    );
+
+    let sample = match result {
+        Ok(sample) => sample,
+        Err(_) => panic!("scripted retries must eventually return the success sample"),
+    };
+    let attempt_ids = attempt_ids.lock().unwrap().clone();
+    let sleep_log = sleep_log.lock().unwrap().clone();
+
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    assert_eq!(attempt_ids.len(), 3);
+    assert!(attempt_ids.iter().all(|meas_id| *meas_id != 0));
+    assert_eq!(attempt_ids.iter().copied().collect::<HashSet<_>>().len(), 3);
+    assert_eq!(sleep_log, vec![1, 2]);
+    assert_eq!(sample.bytes, 4);
+    assert_eq!(sample.bytes_per_second, 4);
+}
+
+#[test]
+fn execute_with_retry_stops_after_two_retries_and_returns_rate_limited() {
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let sleep_log = Arc::new(Mutex::new(Vec::new()));
+    let attempt_count_for_closure = Arc::clone(&attempt_count);
+    let sleep_log_for_closure = Arc::clone(&sleep_log);
+
+    let result = execute_with_retry(
+        RetryPolicy::default(),
+        move |_meas_id| {
+            attempt_count_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(AttemptFailure::RateLimited(Some("1".to_string())))
+        },
+        move |delay_secs| {
+            sleep_log_for_closure.lock().unwrap().push(delay_secs);
+        },
+    );
+
+    let sleep_log = sleep_log.lock().unwrap().clone();
+    assert!(matches!(result, Err(AttemptFailure::RateLimited(_))));
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    assert_eq!(sleep_log, vec![1, 2]);
+}
+
+#[test]
+fn execute_with_retry_returns_non_429_failure_without_sleep_or_retry() {
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let sleep_log = Arc::new(Mutex::new(Vec::new()));
+    let attempt_count_for_closure = Arc::clone(&attempt_count);
+    let sleep_log_for_closure = Arc::clone(&sleep_log);
+
+    let result = execute_with_retry(
+        RetryPolicy::default(),
+        move |_meas_id| {
+            attempt_count_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(AttemptFailure::HttpStatus(503))
+        },
+        move |delay_secs| {
+            sleep_log_for_closure.lock().unwrap().push(delay_secs);
+        },
+    );
+
+    let sleep_log = sleep_log.lock().unwrap().clone();
+    assert!(matches!(result, Err(AttemptFailure::HttpStatus(503))));
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+    assert!(sleep_log.is_empty());
+}
+
+#[test]
+fn execute_with_retry_returns_transport_failure_without_retry() {
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let sleep_log = Arc::new(Mutex::new(Vec::new()));
+    let attempt_count_for_closure = Arc::clone(&attempt_count);
+    let sleep_log_for_closure = Arc::clone(&sleep_log);
+
+    let result = execute_with_retry(
+        RetryPolicy::default(),
+        move |_meas_id| {
+            attempt_count_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(AttemptFailure::Transport)
+        },
+        move |delay_secs| {
+            sleep_log_for_closure.lock().unwrap().push(delay_secs);
+        },
+    );
+
+    let sleep_log = sleep_log.lock().unwrap().clone();
+    assert!(matches!(result, Err(AttemptFailure::Transport)));
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+    assert!(sleep_log.is_empty());
+}
+
+#[test]
+fn download_once_returns_sample_and_records_exact_local_query() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(200, &[1, 2, 3, 4], None)
+    });
+    let agent = local_http_agent();
+    let meas_id = next_meas_id();
+    assert_ne!(meas_id, 0);
+    let result = download_once(&agent, &server.base_url, 4, meas_id);
+    let requests = server.finish();
+
+    let sample = match result {
+        Ok(sample) => sample,
+        Err(_) => panic!("exact local download must return a sample"),
+    };
+    let meas_id_text = meas_id.to_string();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].query_value("bytes"), Some("4"));
+    assert_eq!(requests[0].query_value("measId"), Some(meas_id_text.as_str()));
+    assert_eq!(sample.bytes, 4);
+}
+
+#[test]
+fn download_once_preserves_retry_after_from_local_429() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(429, &[], Some("7"))
+    });
+    let agent = local_http_agent();
+    let result = download_once(&agent, &server.base_url, 4, next_meas_id());
+    let requests = server.finish();
+
+    match result {
+        Err(AttemptFailure::RateLimited(retry_after)) => {
+            assert_eq!(retry_after.as_deref(), Some("7"));
+        }
+        _ => panic!("local 429 must remain a rate-limited failure"),
+    }
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn download_once_rejects_short_local_body_with_expected_and_actual_lengths() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(200, &[1, 2, 3], None)
+    });
+    let agent = local_http_agent();
+    let result = download_once(&agent, &server.base_url, 4, next_meas_id());
+    let requests = server.finish();
+
+    match result {
+        Err(AttemptFailure::InvalidBodyLength { expected, actual }) => {
+            assert_eq!(expected, 4);
+            assert_eq!(actual, 3);
+        }
+        _ => panic!("short local download must report its body lengths"),
+    }
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn download_once_reports_non_429_local_status_without_retry_classification() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(503, &[], None)
+    });
+    let agent = local_http_agent();
+    let result = download_once(&agent, &server.base_url, 4, next_meas_id());
+    let requests = server.finish();
+
+    assert!(matches!(result, Err(AttemptFailure::HttpStatus(503))));
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn upload_once_sends_exact_content_length_and_body_to_local_server() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(200, b"ok", None)
+    });
+    let agent = local_http_agent();
+    let meas_id = next_meas_id();
+    assert_ne!(meas_id, 0);
+    let result = upload_once(&agent, &server.base_url, 9, meas_id);
+    let requests = server.finish();
+
+    let sample = match result {
+        Ok(sample) => sample,
+        Err(_) => panic!("local upload success must return a sample"),
+    };
+    let meas_id_text = meas_id.to_string();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].query_value("measId"), Some(meas_id_text.as_str()));
+    assert_eq!(requests[0].header("content-length"), Some("9"));
+    assert_eq!(requests[0].body, vec![1u8; 9]);
+    assert_eq!(sample.bytes, 9);
+}
+
+#[test]
+fn upload_once_preserves_retry_after_from_local_429() {
+    let server = spawn_local_http_server(1, |_connection_index, _request| {
+        local_http_response(429, &[], Some("11"))
+    });
+    let agent = local_http_agent();
+    let result = upload_once(&agent, &server.base_url, 9, next_meas_id());
+    let requests = server.finish();
+
+    match result {
+        Err(AttemptFailure::RateLimited(retry_after)) => {
+            assert_eq!(retry_after.as_deref(), Some("11"));
+        }
+        _ => panic!("local upload 429 must remain a rate-limited failure"),
+    }
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].header("content-length"), Some("9"));
+    assert_eq!(requests[0].body, vec![1u8; 9]);
 }
