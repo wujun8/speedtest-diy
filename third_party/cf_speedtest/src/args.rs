@@ -21,12 +21,12 @@ pub struct UserArgs {
     #[argh(switch, short = 'u')]
     pub upload_only: bool,
 
-    /// the amount of bytes to download in a single request (default 50MB)
-    #[argh(option, default = "50 * 1024 * 1024")]
+    /// the amount of bytes to download in a single request (default 10MB)
+    #[argh(option, default = "10 * 1024 * 1024")]
     pub bytes_to_download: usize,
 
-    /// the amount of bytes to upload in a single request (default 50MB)
-    #[argh(option, default = "50 * 1024 * 1024")]
+    /// the amount of bytes to upload in a single request (default 10MB)
+    #[argh(option, default = "10 * 1024 * 1024")]
     pub bytes_to_upload: usize,
 
     /// how many seconds to run each upload/download test for (default 12)
@@ -34,15 +34,47 @@ pub struct UserArgs {
     pub test_duration_seconds: u64,
 }
 
+impl Default for UserArgs {
+    fn default() -> Self {
+        Self {
+            download_threads: 8,
+            upload_threads: 8,
+            download_only: false,
+            upload_only: false,
+            bytes_to_download: 10 * 1024 * 1024,
+            bytes_to_upload: 10 * 1024 * 1024,
+            test_duration_seconds: 12,
+        }
+    }
+}
+
 impl UserArgs {
     pub fn validate(&self) -> Result<()> {
         if self.download_only && self.upload_only {
-            Err(Box::new(std::io::Error::new(
+            return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Cannot specify both --download-only and --upload-only",
-            )))
-        } else {
-            Ok(())
+            )));
         }
+
+        if self.bytes_to_download == 0 || self.bytes_to_upload == 0 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Byte counts must be greater than zero",
+            )));
+        }
+
+        if self.download_threads == 0
+            || self.download_threads > 64
+            || self.upload_threads == 0
+            || self.upload_threads > 64
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Thread counts must be between 1 and 64",
+            )));
+        }
+
+        Ok(())
     }
 }

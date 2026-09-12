@@ -1,8 +1,9 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use std::io::Read;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +18,7 @@ use crate::agent::create_configured_agent;
 
 mod locations;
 #[cfg(test)]
+#[rustfmt::skip]
 mod tests;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -26,6 +28,193 @@ static CLOUDFLARE_SPEEDTEST_UPLOAD_URL: &str = "https://speed.cloudflare.com/__u
 static CLOUDFLARE_SPEEDTEST_SERVER_URL: &str =
     "https://speed.cloudflare.com/__down?measId=0&bytes=0";
 static CLOUDFLARE_SPEEDTEST_CGI_URL: &str = "https://speed.cloudflare.com/cdn-cgi/trace";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    Download,
+    Upload,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryDecision {
+    Retry { delay_secs: u64 },
+    Abort,
+    NoRetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryPolicy {
+    max_retries: usize,
+    fallback_delay_secs: u64,
+    max_delay_secs: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            fallback_delay_secs: 1,
+            max_delay_secs: 30,
+        }
+    }
+}
+
+impl RetryPolicy {
+    fn decide(
+        &self,
+        status: u16,
+        retry_after: Option<&str>,
+        attempt_index: usize,
+    ) -> RetryDecision {
+        if status != 429 {
+            return RetryDecision::NoRetry;
+        }
+
+        if attempt_index >= self.max_retries {
+            return RetryDecision::Abort;
+        }
+
+        match retry_after.and_then(parse_retry_after_seconds) {
+            Some(delay_secs) if (1..=self.max_delay_secs).contains(&delay_secs) => {
+                RetryDecision::Retry { delay_secs }
+            }
+            Some(delay_secs) if delay_secs > self.max_delay_secs => RetryDecision::Abort,
+            _ => RetryDecision::Retry {
+                delay_secs: self
+                    .fallback_delay_secs
+                    .saturating_add(attempt_index as u64),
+            },
+        }
+    }
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    value.parse::<u64>().ok()
+}
+
+#[derive(Debug, Default)]
+struct RequestGateState {
+    next_start_ms: u64,
+}
+
+impl RequestGateState {
+    fn reserve_start_ms(&mut self, now_ms: u64) -> u64 {
+        let start_ms = self.next_start_ms.max(now_ms);
+        self.next_start_ms = start_ms.saturating_add(250);
+        start_ms
+    }
+
+    fn extend_retry_deadline_ms(&mut self, deadline_ms: u64) {
+        self.next_start_ms = self.next_start_ms.max(deadline_ms);
+    }
+}
+
+static MEAS_ID_SEED: OnceLock<u64> = OnceLock::new();
+static MEAS_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn initialize_meas_id_seed() -> u64 {
+    let clock_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let process_id = u64::from(std::process::id());
+    let counter_address = (&MEAS_ID_COUNTER as *const AtomicU64 as usize) as u64;
+    let seed = clock_nanos ^ process_id.rotate_left(32) ^ counter_address.rotate_left(17);
+
+    if seed == 0 {
+        1
+    } else {
+        seed
+    }
+}
+
+fn next_meas_id() -> u64 {
+    let seed = *MEAS_ID_SEED.get_or_init(initialize_meas_id_seed);
+
+    loop {
+        let sequence = MEAS_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = seed.wrapping_add(sequence);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+fn build_request_url(direction: Direction, bytes: usize, id: u64) -> String {
+    assert!(id != 0, "measurement id must be non-zero");
+
+    match direction {
+        Direction::Download => {
+            format!("https://speed.cloudflare.com/__down?measId={id}&bytes={bytes}")
+        }
+        Direction::Upload => format!("https://speed.cloudflare.com/__up?measId={id}"),
+        Direction::Both => panic!("cannot build a request URL for both directions"),
+    }
+}
+
+fn is_valid_download_sample(requested: usize, body: &[u8]) -> bool {
+    requested > 0 && body.len() == requested
+}
+
+fn format_timestamped_lines(timestamp: DateTime<Utc>, message: &str) -> String {
+    let prefix = format!(
+        "[{}] ",
+        timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
+    );
+    let mut formatted = String::with_capacity(message.len() + prefix.len());
+
+    for line in message.split_inclusive('\n') {
+        formatted.push_str(&prefix);
+        formatted.push_str(line);
+    }
+
+    formatted
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectionOutcome {
+    SuccessTable,
+    NonZeroFailure,
+}
+
+impl DirectionOutcome {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::SuccessTable => 0,
+            Self::NonZeroFailure => 3,
+        }
+    }
+
+    fn has_success_table(self) -> bool {
+        matches!(self, Self::SuccessTable)
+    }
+}
+
+fn classify_direction_outcome(
+    direction: Direction,
+    download_samples: &[usize],
+    upload_samples: &[usize],
+) -> DirectionOutcome {
+    let download_succeeded = download_samples.iter().any(|sample| *sample > 0);
+    let upload_succeeded = upload_samples.iter().any(|sample| *sample > 0);
+    let success = match direction {
+        Direction::Download => download_succeeded,
+        Direction::Upload => upload_succeeded,
+        Direction::Both => download_succeeded && upload_succeeded,
+    };
+
+    if success {
+        DirectionOutcome::SuccessTable
+    } else {
+        DirectionOutcome::NonZeroFailure
+    }
+}
+
 static OUR_USER_AGENT: &str = concat!(
     "cf_speedtest (",
     env!("CARGO_PKG_VERSION"),
@@ -45,12 +234,20 @@ impl std::io::Read for UploadHelper {
             return Ok(0);
         }
 
-        buf.fill(1);
+        let bytes_remaining = self
+            .bytes_to_send
+            .saturating_sub(self.byte_ctr.load(Ordering::SeqCst));
+        let bytes_to_fill = buf.len().min(bytes_remaining);
+        if bytes_to_fill == 0 {
+            return Ok(0);
+        }
 
-        self.byte_ctr.fetch_add(buf.len(), Ordering::SeqCst);
+        buf[..bytes_to_fill].fill(1);
+
+        self.byte_ctr.fetch_add(bytes_to_fill, Ordering::SeqCst);
         self.total_uploaded_counter
-            .fetch_add(buf.len(), Ordering::SeqCst);
-        Ok(buf.len())
+            .fetch_add(bytes_to_fill, Ordering::SeqCst);
+        Ok(bytes_to_fill)
     }
 }
 
