@@ -168,6 +168,7 @@ run_wait_lifecycle_case() {
         . "$SCRIPT"
         . "$ROOT/network-runtime.sh"
         trap 'cancel_network_runtime; printf "%s\n" done >"$TRAP_FILE"; exit 143' TERM INT
+        unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX
         "$wait_command"
     ) >"$output_file" 2>"$error_file" &
     WAIT_LIFECYCLE_PID=$!
