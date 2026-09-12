@@ -3,12 +3,20 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd -P)
+LOGGER="$REPO_ROOT/runtime-log.sh"
 RUNTIME="$REPO_ROOT/network-runtime.sh"
 
+if [[ ! -f "$LOGGER" ]]; then
+  printf 'FAIL: runtime-log.sh is missing (RED: logger has not been implemented)\n' >&2
+  exit 1
+fi
 if [[ ! -f "$RUNTIME" ]]; then
   printf 'FAIL: network-runtime.sh is missing (RED: helper has not been implemented)\n' >&2
   exit 1
 fi
+
+# shellcheck source=/dev/null
+source "$LOGGER"
 
 STATE=$(mktemp -d "${TMPDIR:-/tmp}/network-runtime-test.XXXXXX")
 FAKE_BIN="$STATE/bin"
@@ -304,6 +312,9 @@ if (( proxy_env_present != 0 )); then
   exit 96
 fi
 printf 'pid=%s via=%s args=%s\n' "$$" "${FAKE_VIA_PROXY:-0}" "$*" >> "$FAKE_STATE/cf.calls"
+if [[ "${FAKE_CF_EMIT_LOG:-false}" == 'true' ]]; then
+  printf '[2026-01-02T03:04:05.678Z] child output\n' >&2
+fi
 if [[ "${FAKE_CF_FAIL:-false}" == 'true' ]]; then
   exit 19
 fi
@@ -379,6 +390,23 @@ assert_not_contains() {
   [[ "$haystack" != *"$needle"* ]] || fail "$message (unexpected [$needle])"
 }
 
+assert_timestamped_file() {
+  local file=$1
+  local expected_lines=$2
+  local message=$3
+  local line
+  local count=0
+
+  [[ -f "$file" ]] || fail "$message output file is missing"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    count=$((count + 1))
+    if [[ ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+      fail "$message line is not a UTC RFC3339-millisecond log: [$line]"
+    fi
+  done <"$file"
+  assert_eq "$expected_lines" "$count" "$message line count"
+}
+
 set_poison_proxy_env() {
   HTTP_PROXY='poison-HTTP_PROXY'
   HTTPS_PROXY='poison-HTTPS_PROXY'
@@ -441,7 +469,7 @@ reset_fake_state() {
   rm -f "$STATE"/cf-pid "$STATE"/release-cf "$STATE"/cf-trap-complete
   rm -f "$STATE"/registration-child-pid.* "$STATE"/registration-complete.* \
     "$STATE"/race-curl-pid "$STATE"/race-worker-pid "$STATE"/race-term-count-*
-  unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS
+  unset FAKE_WGET_MODE FAKE_TOTAL FAKE_BARRIER FAKE_EXPECT_SEGMENTS FAKE_HOLD_WORKERS FAKE_CF_EMIT_LOG
   unset FAKE_BAD_RANGE FAKE_FAIL_RANGE FAKE_CF_FAIL FAKE_CF_HOLD FAKE_REQUIRE_URL_BOUNDARY
   unset FAKE_RACE_CURL FAKE_RACE_DEDUPE
   unset FAKE_VIA_PROXY PROXYCHAINS_CONF_FILE
@@ -589,6 +617,10 @@ assert_no_runtime_temp_dirs() {
 opts_before=$(set +o)
 source "$RUNTIME"
 opts_after=$(set +o)
+runtime_source_text=$(<"$RUNTIME")
+if grep -nE 'printf[[:space:]].*(ERROR:|WARNING:|URL download (skipped|complete):)' <<<"$runtime_source_text"; then
+  fail 'network-runtime.sh still prints a user-visible message directly'
+fi
 assert_eq "$opts_before" "$opts_after" 'sourcing helper changed caller shell options'
 assert_eq '0' "$(count_lines "$STATE/curl.calls")" 'source performed a curl call'
 assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'source performed a wget call'
@@ -598,19 +630,48 @@ runtime_text=$(<"$RUNTIME")
 assert_not_contains "$runtime_text" 'wget' 'production helper still references wget'
 pass 'source is inert, preserves shell options, and is curl-only'
 
+# Internal machine-readable values stay undecorated even when user logs use the logger.
+normalized=$(_nr_normalize_decimal 00000042)
+assert_eq '42' "$normalized" 'decimal normalizer added a log prefix'
+printf '206\t1\n' >"$STATE/raw.metadata"
+metadata_tuple=$(_nr_parse_curl_metadata "$STATE/raw.metadata")
+assert_eq $'206\t1' "$metadata_tuple" 'metadata tuple added a log prefix'
+printf '200\t101\n' >"$STATE/raw-full.metadata"
+full_total=$(_nr_validate_full_response "$STATE/raw-full.metadata")
+assert_eq '101' "$full_total" 'full-response total added a log prefix'
+printf 'HTTP/1.1 206\nContent-Range: bytes 0-0/101\n\n' >"$STATE/raw-probe.headers"
+printf '206\t1\n' >"$STATE/raw-probe.metadata"
+probe_total=$(_nr_validate_probe_response "$STATE/raw-probe.headers" "$STATE/raw-probe.metadata")
+assert_eq '101' "$probe_total" 'probe total added a log prefix'
+raw_runtime_dir=$(_nr_create_runtime_dir)
+[[ "$raw_runtime_dir" == "$RUNTIME_TMP"/network-runtime.* ]] || fail 'runtime-dir machine output was not a raw path'
+[[ "$raw_runtime_dir" != *'['* ]] || fail 'runtime-dir machine output was decorated'
+_nr_remove_runtime_dir "$raw_runtime_dir"
+pass 'machine-readable paths, decimals, metadata, and totals remain raw'
+
 # Configuration validation: defaults, normalization, accepted modes, and rejects.
-unset DOWNLOAD_THREADS SPEEDTEST_DOWNLOAD_ONLY PROXY_CONFIG
+unset DOWNLOAD_THREADS SPEEDTEST_DOWNLOAD_ONLY SPEEDTEST_DOWNLOAD_BYTES SPEEDTEST_UPLOAD_BYTES PROXY_CONFIG
 validate_network_runtime_config
 assert_eq '4' "$DOWNLOAD_THREADS" 'unset DOWNLOAD_THREADS did not default to 4'
 assert_eq 'false' "$SPEEDTEST_DOWNLOAD_ONLY" 'unset SPEEDTEST_DOWNLOAD_ONLY did not default to false'
+assert_eq '10485760' "$SPEEDTEST_DOWNLOAD_BYTES" 'unset SPEEDTEST_DOWNLOAD_BYTES did not default to 10485760'
+assert_eq '10485760' "$SPEEDTEST_UPLOAD_BYTES" 'unset SPEEDTEST_UPLOAD_BYTES did not default to 10485760'
 DOWNLOAD_THREADS=004
 SPEEDTEST_DOWNLOAD_ONLY=true
+SPEEDTEST_DOWNLOAD_BYTES=00000042
+SPEEDTEST_UPLOAD_BYTES=00000043
 validate_network_runtime_config
 assert_eq '4' "$DOWNLOAD_THREADS" 'leading-zero DOWNLOAD_THREADS was not normalized'
 assert_eq 'true' "$SPEEDTEST_DOWNLOAD_ONLY" 'true download-only mode was not accepted'
+assert_eq '42' "$SPEEDTEST_DOWNLOAD_BYTES" 'leading-zero SPEEDTEST_DOWNLOAD_BYTES was not normalized'
+assert_eq '43' "$SPEEDTEST_UPLOAD_BYTES" 'leading-zero SPEEDTEST_UPLOAD_BYTES was not normalized'
 SPEEDTEST_DOWNLOAD_ONLY=false
+SPEEDTEST_DOWNLOAD_BYTES=2147483647
+SPEEDTEST_UPLOAD_BYTES=1
 validate_network_runtime_config
 assert_eq 'false' "$SPEEDTEST_DOWNLOAD_ONLY" 'false download-only mode was not accepted'
+assert_eq '2147483647' "$SPEEDTEST_DOWNLOAD_BYTES" 'maximum SPEEDTEST_DOWNLOAD_BYTES was not accepted'
+assert_eq '1' "$SPEEDTEST_UPLOAD_BYTES" 'minimum SPEEDTEST_UPLOAD_BYTES was not accepted'
 pass 'configuration defaults, normalization, and accepted values'
 
 for invalid_threads in 0 00 65 999 abc 4.0 +4 ''; do
@@ -621,8 +682,56 @@ for invalid_threads in 0 00 65 999 abc 4.0 +4 ''; do
   fi
   assert_eq '0' "$(count_lines "$STATE/curl.calls")" "invalid DOWNLOAD_THREADS [$invalid_threads] invoked curl"
   assert_eq '0' "$(count_lines "$STATE/wget.calls")" "invalid DOWNLOAD_THREADS [$invalid_threads] invoked wget"
+  assert_timestamped_file "$STATE/invalid-thread.err" 1 "invalid DOWNLOAD_THREADS [$invalid_threads] error" || exit 1
 done
 pass 'invalid DOWNLOAD_THREADS values fail before network calls'
+
+invalid_byte_values=(0 00 '' +1 -1 1.5 2147483648 abc)
+invalid_byte_index=0
+for invalid_bytes in "${invalid_byte_values[@]}"; do
+  invalid_byte_index=$((invalid_byte_index + 1))
+  reset_fake_state
+  if (DOWNLOAD_THREADS=1; SPEEDTEST_DOWNLOAD_ONLY=false; \
+      SPEEDTEST_DOWNLOAD_BYTES="$invalid_bytes"; SPEEDTEST_UPLOAD_BYTES=10485760; \
+      run_url_download 'http://example.test/file') \
+      >"$STATE/invalid-download-bytes-$invalid_byte_index.out" \
+      2>"$STATE/invalid-download-bytes-$invalid_byte_index.err"; then
+    fail "invalid SPEEDTEST_DOWNLOAD_BYTES [$invalid_bytes] was accepted"
+  fi
+  assert_eq '0' "$(count_lines "$STATE/curl.calls")" \
+    "invalid SPEEDTEST_DOWNLOAD_BYTES [$invalid_bytes] invoked curl"
+  assert_eq '0' "$(count_lines "$STATE/wget.calls")" \
+    "invalid SPEEDTEST_DOWNLOAD_BYTES [$invalid_bytes] invoked wget"
+  assert_eq '0' "$(count_lines "$STATE/proxy.calls")" \
+    "invalid SPEEDTEST_DOWNLOAD_BYTES [$invalid_bytes] invoked proxychains4"
+  assert_timestamped_file "$STATE/invalid-download-bytes-$invalid_byte_index.err" 1 \
+    "invalid SPEEDTEST_DOWNLOAD_BYTES [$invalid_bytes] error" || exit 1
+  assert_no_runtime_temp_dirs
+done
+pass 'invalid SPEEDTEST_DOWNLOAD_BYTES values fail before network calls'
+
+invalid_byte_index=0
+for invalid_bytes in "${invalid_byte_values[@]}"; do
+  invalid_byte_index=$((invalid_byte_index + 1))
+  reset_fake_state
+  if (DOWNLOAD_THREADS=1; SPEEDTEST_DOWNLOAD_ONLY=false; \
+      SPEEDTEST_DOWNLOAD_BYTES=10485760; SPEEDTEST_UPLOAD_BYTES="$invalid_bytes"; \
+      run_url_download 'http://example.test/file') \
+      >"$STATE/invalid-upload-bytes-$invalid_byte_index.out" \
+      2>"$STATE/invalid-upload-bytes-$invalid_byte_index.err"; then
+    fail "invalid SPEEDTEST_UPLOAD_BYTES [$invalid_bytes] was accepted"
+  fi
+  assert_eq '0' "$(count_lines "$STATE/curl.calls")" \
+    "invalid SPEEDTEST_UPLOAD_BYTES [$invalid_bytes] invoked curl"
+  assert_eq '0' "$(count_lines "$STATE/wget.calls")" \
+    "invalid SPEEDTEST_UPLOAD_BYTES [$invalid_bytes] invoked wget"
+  assert_eq '0' "$(count_lines "$STATE/proxy.calls")" \
+    "invalid SPEEDTEST_UPLOAD_BYTES [$invalid_bytes] invoked proxychains4"
+  assert_timestamped_file "$STATE/invalid-upload-bytes-$invalid_byte_index.err" 1 \
+    "invalid SPEEDTEST_UPLOAD_BYTES [$invalid_bytes] error" || exit 1
+  assert_no_runtime_temp_dirs
+done
+pass 'invalid SPEEDTEST_UPLOAD_BYTES values fail before network calls'
 
 for invalid_mode in TRUE False 1 0 yes ''; do
   reset_fake_state
@@ -631,6 +740,7 @@ for invalid_mode in TRUE False 1 0 yes ''; do
     fail "invalid SPEEDTEST_DOWNLOAD_ONLY [$invalid_mode] was accepted"
   fi
   assert_eq '0' "$(count_lines "$STATE/cf.calls")" "invalid mode [$invalid_mode] invoked cf_speedtest"
+  assert_timestamped_file "$STATE/invalid-mode.err" 1 "invalid mode [$invalid_mode] error" || exit 1
 done
 pass 'invalid SPEEDTEST_DOWNLOAD_ONLY values fail before speed tests'
 
@@ -650,6 +760,7 @@ assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'direct URL isolation test ma
 assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'direct URL isolation test used proxychains4'
 assert_child_proxy_env_absent "$STATE/curl.env" 1
 assert_curl_options 1
+assert_timestamped_file "$STATE/env-direct-url.out" 1 'direct URL summary log'
 assert_poison_proxy_env_preserved
 pass 'direct URL clears all ambient proxy variables and disables curlrc'
 
@@ -666,6 +777,7 @@ assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy URL isolation test di
 assert_child_proxy_env_absent "$STATE/curl.env" 1
 assert_child_proxy_env_absent "$STATE/proxy.env" 1
 assert_curl_options 1
+assert_timestamped_file "$STATE/env-proxy-url.out" 1 'proxy URL summary log'
 assert_poison_proxy_env_preserved
 pass 'proxy URL clears all ambient proxy variables before proxychains4'
 
@@ -728,6 +840,7 @@ assert_not_contains "$(<"$STATE/barrier.calls")" 'barrier_failed' 'segment worke
 assert_contains "$(<"$STATE/direct.out")" 'total bytes=101' 'direct summary omitted total bytes'
 assert_contains "$(<"$STATE/direct.out")" 'concurrent segments=4' 'direct summary omitted effective segment count'
 assert_contains "$(<"$STATE/direct.out")" 'transport=direct' 'direct summary omitted transport'
+assert_timestamped_file "$STATE/direct.out" 1 'direct segmented summary log'
 assert_all_curl_outputs_are_dev_null
 assert_all_curl_calls_have_metadata
 assert_no_worktree_response_files
@@ -750,6 +863,7 @@ assert_not_contains "$(<"$STATE/proxy.calls")" "$PROXY_CONFIG" 'proxy content wa
 assert_not_contains "$(<"$STATE/proxy.calls")" 'args=-f' 'proxy wrapper received a config-file flag'
 assert_contains "$(<"$STATE/proxy.calls")" 'args=curl ' 'proxy wrapper did not receive curl as its command'
 assert_contains "$(<"$STATE/proxy-url.out")" 'transport=proxy' 'proxy summary omitted transport'
+assert_timestamped_file "$STATE/proxy-url.out" 1 'proxy segmented summary log'
 assert_all_curl_outputs_are_dev_null
 assert_all_curl_calls_have_metadata
 assert_eq '5' "$(awk '$7 ~ /\/network-runtime\.[^/]+\// { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'curl metadata did not stay inside a private runtime directory'
@@ -771,6 +885,7 @@ assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'single-thread download invok
 assert_eq '1' "$(awk '$2 == "kind=full" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'single-thread download was not complete'
 assert_eq '0' "$(awk '$2 == "kind=range" { n++ } END { print n + 0 }' "$STATE/curl.calls")" 'single-thread download issued a Range probe'
 assert_contains "$(<"$STATE/one.out")" 'concurrent segments=1' 'single-thread summary omitted effective segment count'
+assert_timestamped_file "$STATE/one.out" 1 'single-thread summary log'
 assert_all_curl_outputs_are_dev_null
 assert_all_curl_calls_have_metadata
 pass 'single-thread download is one complete /dev/null request'
@@ -784,6 +899,7 @@ run_capture "$STATE/url-boundary.out" "$STATE/url-boundary.err" run_url_download
 assert_eq '0' "$CALL_RC" 'URL option boundary download failed'
 assert_eq '1' "$(count_lines "$STATE/curl.calls")" 'URL option boundary issued the wrong number of curl calls'
 assert_contains "$(<"$STATE/url-boundary.out")" 'total bytes=101' 'URL option boundary omitted the complete-download summary'
+assert_timestamped_file "$STATE/url-boundary.out" 1 'URL option boundary summary log'
 pass 'curl terminates options before the URL argument'
 
 # Range unsupported, malformed probe, and total <= 1 are fail-closed.
@@ -1128,6 +1244,7 @@ assert_eq '0' "$(count_lines "$STATE/curl.calls")" 'empty URL invoked curl'
 assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'empty URL invoked wget'
 assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'empty URL invoked proxychains4'
 assert_contains "$(<"$STATE/empty.out")" 'skipped' 'empty URL did not emit an English skip log'
+assert_timestamped_file "$STATE/empty.out" 1 'empty URL skip log'
 pass 'empty URL skips with zero network calls'
 
 # Speed tests: direct both/down-only; direct never uses proxychains4.
@@ -1174,7 +1291,88 @@ assert_eq '0' "$CALL_RC" 'empty proxy config did not skip successfully'
 assert_eq '0' "$(count_lines "$STATE/cf.calls")" 'empty proxy config called cf_speedtest'
 assert_eq '0' "$(count_lines "$STATE/proxy.calls")" 'empty proxy config called proxychains4'
 assert_contains "$(<"$STATE/cf-proxy-skip.err")" 'WARNING: proxy speed test skipped' 'proxy skip warning was not clear English'
+assert_timestamped_file "$STATE/cf-proxy-skip.err" 1 'proxy skip warning log'
 pass 'proxy cf_speedtest uses configured proxy or skips safely when absent'
+
+# The generated caller supplies the byte flags; helpers preserve them exactly once.
+reset_fake_state
+unset PROXY_CONFIG
+SPEEDTEST_DOWNLOAD_ONLY=false
+TEST_DURATION=11
+DOWNLOAD_THREADS=7
+UPLOAD_THREADS=8
+SPEEDTEST_DOWNLOAD_BYTES=123456
+SPEEDTEST_UPLOAD_BYTES=654321
+run_capture "$STATE/cf-direct-explicit.out" "$STATE/cf-direct-explicit.err" \
+  run_cf_speedtest_direct \
+  --test-duration-seconds "$TEST_DURATION" \
+  --download-threads "$DOWNLOAD_THREADS" \
+  --upload-threads "$UPLOAD_THREADS" \
+  --bytes-to-download "$SPEEDTEST_DOWNLOAD_BYTES" \
+  --bytes-to-upload "$SPEEDTEST_UPLOAD_BYTES"
+assert_eq '0' "$CALL_RC" 'direct explicit byte argv failed'
+cf_log=$(<"$STATE/cf.calls")
+direct_args=${cf_log#*args=}
+assert_eq \
+  '--test-duration-seconds 11 --download-threads 7 --upload-threads 8 --bytes-to-download 123456 --bytes-to-upload 654321' \
+  "$direct_args" 'direct helper changed the explicit byte argv'
+assert_eq '1' "$(grep -Fo -- '--bytes-to-download' "$STATE/cf.calls" | wc -l)" \
+  'direct helper appended a duplicate download-byte flag'
+assert_eq '1' "$(grep -Fo -- '--bytes-to-upload' "$STATE/cf.calls" | wc -l)" \
+  'direct helper appended a duplicate upload-byte flag'
+
+reset_fake_state
+export PROXY_CONFIG='socks5 127.0.0.1 9100'
+SPEEDTEST_DOWNLOAD_ONLY=false
+run_capture "$STATE/cf-proxy-explicit.out" "$STATE/cf-proxy-explicit.err" \
+  run_cf_speedtest_proxy \
+  --test-duration-seconds "$TEST_DURATION" \
+  --download-threads "$DOWNLOAD_THREADS" \
+  --upload-threads "$UPLOAD_THREADS" \
+  --bytes-to-download "$SPEEDTEST_DOWNLOAD_BYTES" \
+  --bytes-to-upload "$SPEEDTEST_UPLOAD_BYTES"
+assert_eq '0' "$CALL_RC" 'proxy explicit byte argv failed'
+cf_log=$(<"$STATE/cf.calls")
+proxy_args=${cf_log#*args=}
+assert_eq \
+  '--test-duration-seconds 11 --download-threads 7 --upload-threads 8 --bytes-to-download 123456 --bytes-to-upload 654321' \
+  "$proxy_args" 'proxy helper changed the explicit byte argv'
+assert_eq '1' "$(grep -Fo -- '--bytes-to-download' "$STATE/cf.calls" | wc -l)" \
+  'proxy helper appended a duplicate download-byte flag'
+assert_eq '1' "$(grep -Fo -- '--bytes-to-upload' "$STATE/cf.calls" | wc -l)" \
+  'proxy helper appended a duplicate upload-byte flag'
+pass 'direct and proxy helpers preserve exact byte argv without duplicates'
+
+reset_fake_state
+unset PROXY_CONFIG
+export FAKE_CF_EMIT_LOG=true
+run_capture "$STATE/cf-child-log.out" "$STATE/cf-child-log.err" \
+  run_cf_speedtest_direct --test-duration-seconds 11 --download-threads 7 \
+  --upload-threads 8 --bytes-to-download 123456 --bytes-to-upload 654321
+assert_eq '0' "$CALL_RC" 'direct child log fixture failed'
+assert_eq '[2026-01-02T03:04:05.678Z] child output' \
+  "$(<"$STATE/cf-child-log.err")" 'timestamped child output was double-prefixed'
+pass 'already-timestamped cf child output is not double-prefixed'
+
+# A child failure must reach both helper callers unchanged.
+reset_fake_state
+unset PROXY_CONFIG
+export FAKE_CF_FAIL=true
+run_capture "$STATE/cf-direct-fail.out" "$STATE/cf-direct-fail.err" \
+  run_cf_speedtest_direct --test-duration-seconds 11 --download-threads 7 \
+  --upload-threads 8 --bytes-to-download 123456 --bytes-to-upload 654321
+assert_eq '19' "$CALL_RC" 'direct helper masked the child nonzero status'
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'direct child failure call count was wrong'
+
+reset_fake_state
+export PROXY_CONFIG='socks5 127.0.0.1 9100' FAKE_CF_FAIL=true
+run_capture "$STATE/cf-proxy-fail.out" "$STATE/cf-proxy-fail.err" \
+  run_cf_speedtest_proxy --test-duration-seconds 11 --download-threads 7 \
+  --upload-threads 8 --bytes-to-download 123456 --bytes-to-upload 654321
+assert_eq '19' "$CALL_RC" 'proxy helper masked the child nonzero status'
+assert_eq '1' "$(count_lines "$STATE/cf.calls")" 'proxy child failure call count was wrong'
+assert_eq '1' "$(count_lines "$STATE/proxy.calls")" 'proxy child failure wrapper call count was wrong'
+pass 'direct and proxy helpers propagate child failures'
 
 assert_no_worktree_response_files
 assert_eq '0' "$(count_lines "$STATE/wget.calls")" 'test run made a wget call'

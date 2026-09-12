@@ -30,6 +30,23 @@ assert_not_contains() {
     esac
 }
 
+assert_timestamped_file() {
+    local file=$1 expected_lines=$2 label=$3
+    local line count=0
+    if [ ! -f "$file" ]; then
+        fail "$label output file is missing"
+        return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        count=$((count + 1))
+        if [[ ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+            fail "$label line is not a UTC RFC3339-millisecond log: [$line]"
+            return 1
+        fi
+    done <"$file"
+    assert_eq "$expected_lines" "$count" "$label line count"
+}
+
 read_pid_marker() {
     local pid_file=$1 pid_line='' pid_extra='' pid_fd
     if [ ! -s "$pid_file" ]; then
@@ -57,17 +74,32 @@ read_pid_marker() {
     printf '%s\n' "$pid_line"
 }
 
+LOGGER=$ROOT/runtime-log.sh
 SCRIPT=$ROOT/random-wait.sh
+if [ ! -f "$LOGGER" ]; then
+    fail "runtime-log.sh is missing (RED: logger has not been implemented)"
+    exit 1
+fi
 if [ ! -f "$SCRIPT" ]; then
     fail "random-wait.sh is missing"
     exit 1
 fi
 
 # shellcheck source=/dev/null
+. "$LOGGER" || {
+    fail "runtime-log.sh could not be sourced"
+    exit 1
+}
+# shellcheck source=/dev/null
 . "$SCRIPT" || {
     fail "random-wait.sh could not be sourced"
     exit 1
 }
+random_source_text=$(<"$SCRIPT")
+if grep -nE 'printf[[:space:]].*(random-wait:|Waiting .+ seconds)' <<<"$random_source_text"; then
+    fail 'random-wait.sh still prints a user-visible message directly'
+    exit 1
+fi
 
 TMP_DIR=$(mktemp -d)
 cleanup() {
@@ -120,8 +152,16 @@ chmod 755 "$FAKE_BIN/shuf" "$FAKE_BIN/sleep"
     export PATH SHUF_LOG SLEEP_LOG
     sampled=$(sample_wait_seconds) || exit 1
     assert_eq 17 "$sampled" "default sample"
+    case "$sampled" in
+        *'['*|*$'\n'*)
+            fail "sample_wait_seconds returned a decorated machine-readable value"
+            exit 1
+            ;;
+    esac
     assert_eq '-i 5-50 -n 1' "$(<"$SHUF_LOG")" "default shuf range"
-    wait_output=$(wait_for_next_run) || exit 1
+    wait_for_next_run >"$TMP_DIR/default-wait.out" || exit 1
+    wait_output=$(<"$TMP_DIR/default-wait.out")
+    assert_timestamped_file "$TMP_DIR/default-wait.out" 1 'default wait log' || exit 1
     assert_contains "$wait_output" 'Waiting 17 seconds before running the tests again...' \
         'English wait message' || exit 1
     assert_not_contains "$wait_output" 'Attente de' 'French wait message' || exit 1
@@ -195,6 +235,7 @@ run_wait_lifecycle_case() {
     PATH="$FAKE_BIN:$PATH"
     export PATH SHUF_LOG SLEEP_LOG SLEEP_PID_FILE TRAP_FILE FAKE_SLEEP_HOLD
     (
+        . "$LOGGER"
         . "$SCRIPT"
         . "$ROOT/network-runtime.sh"
         trap 'cancel_network_runtime; printf "%s\n" done >"$TRAP_FILE"; exit 143' TERM INT
@@ -245,23 +286,26 @@ run_wait_lifecycle_case initial wait_for_initial_start || exit 1
 run_wait_lifecycle_case loop wait_for_next_run || exit 1
 
 validate_default() {
-    env -i PATH="$PATH" bash -c 'set -u; . "$1"; unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX; validate_wait_config' _ "$SCRIPT"
+    env -i PATH="$PATH" bash -c 'set -u; . "$1"; . "$2"; unset WAIT_TIME WAIT_TIME_MIN WAIT_TIME_MAX; validate_wait_config' _ "$LOGGER" "$SCRIPT"
 }
 
 validate_case() {
     local wait=$1 min=$2 max=$3
     env -i PATH="$PATH" WAIT_TIME="$wait" WAIT_TIME_MIN="$min" WAIT_TIME_MAX="$max" \
-        bash -c 'set -u; . "$1"; validate_wait_config' _ "$SCRIPT"
+        bash -c 'set -u; . "$1"; . "$2"; validate_wait_config' _ "$LOGGER" "$SCRIPT"
 }
 
 assert_invalid_case() {
-    local label=$1 wait=$2 min=$3 max=$4 output
+    local label=$1 wait=$2 min=$3 max=$4 output error_file
+    error_file="$TMP_DIR/invalid-${label//[^[:alnum:]_.-]/_}.err"
     if output=$(env -i PATH="$PATH" WAIT_TIME="$wait" WAIT_TIME_MIN="$min" WAIT_TIME_MAX="$max" \
-        bash -c 'set -u; . "$1"; validate_wait_config' _ "$SCRIPT" 2>&1); then
+        bash -c 'set -u; . "$1"; . "$2"; validate_wait_config' _ "$LOGGER" "$SCRIPT" 2>&1); then
         fail "$label unexpectedly passed"
         return 1
     fi
+    printf '%s\n' "$output" >"$error_file"
     assert_contains "$output" 'random-wait:' "$label error"
+    assert_timestamped_file "$error_file" 1 "$label error log"
 }
 
 validate_default || exit 1

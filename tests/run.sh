@@ -44,6 +44,14 @@ require_no_line() {
     fi
 }
 
+require_regex() {
+    local file=$1 pattern=$2 label=$3
+    if ! grep -Eq -- "$pattern" "$file"; then
+        printf 'FAIL: %s (missing regex %s)\n' "$label" "$pattern" >&2
+        return 1
+    fi
+}
+
 extract_job() {
     local file=$1 job_name=$2
     awk -v job="  ${job_name}:" '
@@ -370,24 +378,59 @@ anonymous_ghcr_contract() {
 }
 
 dockerfile_contract() {
-    local file=$ROOT/Dockerfile
+    local file=$ROOT/Dockerfile builder_commands command frozen_file
+    local rust_digest='rust:1.87.0-slim-bookworm@sha256:c6d2b4f8115be78af2a07072f61cffbbb4d6c93b55a4712b922fb7391db6a2bc'
+    local runtime_digest='zephir284/speedtest@sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334'
     require_file "$file" || return 1
-    require_line "$file" 'FROM --platform=linux/amd64 zephir284/speedtest@sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' 'frozen amd64 base' || return 1
+    require_line "$file" "FROM --platform=linux/amd64 $rust_digest AS builder" 'frozen amd64 Rust builder' || return 1
+    require_line "$file" "FROM --platform=linux/amd64 $runtime_digest" 'frozen amd64 runtime base' || return 1
+    for frozen_file in \
+        'COPY third_party/cf_speedtest/Cargo.toml' \
+        'COPY third_party/cf_speedtest/Cargo.lock' \
+        'COPY third_party/cf_speedtest/src' \
+        'COPY third_party/cf_speedtest/LICENSE.txt' \
+        'COPY third_party/cf_speedtest/UPSTREAM.json'; do
+        require_line "$file" "$frozen_file" "frozen Rust source copy: $frozen_file" || return 1
+    done
+    require_line "$file" 'cargo fetch --locked' 'locked Rust dependency fetch' || return 1
+    require_regex "$file" 'cargo[[:space:]]+test[^\n]*--locked[^\n]*--offline' 'offline locked Rust tests' || return 1
+    require_regex "$file" 'cargo[[:space:]]+build[^\n]*--locked[^\n]*--offline' 'offline locked Rust build' || return 1
+    builder_commands=$(grep -nE 'cargo[[:space:]]+(test|build)' "$file" || true)
+    while IFS= read -r command; do
+        [ -n "$command" ] || continue
+        case "$command" in
+            *'--offline'*) ;;
+            *)
+                printf 'FAIL: live Rust test/build command is forbidden: %s\n' "$command" >&2
+                return 1
+                ;;
+        esac
+    done <<<"$builder_commands"
+    require_line "$file" 'COPY --from=builder' 'builder artifact copy' || return 1
+    require_regex "$file" '^COPY --from=builder[^\n]*cf_speedtest[^\n]*/usr/local/bin/cf_speedtest' 'runtime cf_speedtest binary path' || return 1
+    require_regex "$file" '^COPY --from=builder[^\n]*LICENSE' 'runtime MIT provenance copy' || return 1
+    require_line "$file" 'cf_speedtest --help' 'final cf_speedtest help check' || return 1
     require_line "$file" 'apt-get update' 'APT package index update' || return 1
     require_line "$file" 'apt-get install -y --no-install-recommends curl ca-certificates' 'curl and CA package install' || return 1
     require_line "$file" 'rm -rf /var/lib/apt/lists/*' 'APT list cleanup' || return 1
+    require_line "$file" 'COPY runtime-log.sh /usr/local/bin/runtime-log.sh' 'runtime logger image copy' || return 1
     require_line "$file" 'COPY random-wait.sh /usr/local/bin/random-wait.sh' 'random helper image copy' || return 1
     require_line "$file" 'COPY network-runtime.sh /usr/local/bin/network-runtime.sh' 'network helper image copy' || return 1
     require_line "$file" 'COPY patch-entrypoint.sh /usr/local/bin/patch-entrypoint.sh' 'patch helper image copy' || return 1
-    require_line "$file" 'chmod 0755 /usr/local/bin/random-wait.sh /usr/local/bin/network-runtime.sh /usr/local/bin/patch-entrypoint.sh' 'runtime helper modes' || return 1
+    require_regex "$file" 'chmod[[:space:]]+0755[^\n]*runtime-log\.sh[^\n]*random-wait\.sh[^\n]*network-runtime\.sh[^\n]*patch-entrypoint\.sh' 'runtime helper modes' || return 1
     require_line "$file" '/usr/local/bin/patch-entrypoint.sh /entrypoint.sh' 'build-time patch' || return 1
     require_line "$file" 'ENTRYPOINT ["/entrypoint.sh"]' 'upstream entrypoint' || return 1
+    if grep -nE 'git[[:space:]]+clone|^[[:space:]]*ADD[[:space:]]+(https?://|git@)|rust(:|[^[:space:]]*:)latest' "$file"; then
+        printf 'FAIL: Dockerfile uses an unfrozen remote/latest builder source\n' >&2
+        return 1
+    fi
     require_no_line "$file" 'arm64' 'Dockerfile architecture scope' || return 1
     if grep -nE '(^|[^[:alnum:]_])eval([[:space:]]|$)' "$file"; then
         printf 'FAIL: Dockerfile contains eval\n' >&2
         return 1
     fi
 }
+
 
 compose_contract() {
     local file=$ROOT/compose.yaml
@@ -518,6 +561,7 @@ notice_contract() {
 }
 
 run_group 'test fixture portability' portability_contract
+run_group 'runtime logger behavior' bash "$ROOT/tests/test_runtime_log.sh"
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
 run_group 'network runtime behavior' bash "$ROOT/tests/test_network_runtime.sh"
 run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"

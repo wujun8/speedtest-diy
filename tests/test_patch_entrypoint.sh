@@ -50,6 +50,8 @@ cat >"$SYNTHETIC_FIXTURE" <<'EOF'
 : "${TEST_DURATION:=10}"
 : "${DOWNLOAD_THREADS:=4}"
 : "${UPLOAD_THREADS:=4}"
+: "${SPEEDTEST_DOWNLOAD_BYTES:=10485760}"
+: "${SPEEDTEST_UPLOAD_BYTES:=10485760}"
 : "${SPEEDTEST_DOWNLOAD_ONLY:=false}"
 : "${RUN_SPEEDTEST_DIRECT:=true}"
 : "${RUN_SPEEDTEST_PROXY:=true}"
@@ -146,38 +148,105 @@ OLD_SIGNAL="trap \"echo -e '\\e[1;31m${OLD_SIGNAL_TEXT}\\e[0m'; exit 0\" SIGTERM
 OLD_SIGNAL_LINE=$OLD_SIGNAL
 OLD_DOWNLOAD_START_LINE="        echo -e \"\\n\${BLUE}\${BOLD}${OLD_DOWNLOAD_START_TEXT}\${RESET}\\n\""
 OLD_EMPTY_URL_LINE="        echo -e \"\\n\${YELLOW}\${BOLD}${OLD_EMPTY_URL_TEXT}\${RESET}\\n\""
-NEW_SIGNAL='trap "cancel_network_runtime; echo '\''Stop requested. Cleaning up and exiting...'\''; exit 0" SIGTERM SIGINT'
-NEW_DIRECT_ERROR='            echo -e "${RED}${BOLD}Error: direct speed test failed${RESET}"'
-NEW_DIRECT_DISABLED='        echo -e "${YELLOW}${BOLD}Direct speed test disabled.${RESET}"'
-NEW_PROXY_ERROR='            echo -e "${RED}${BOLD}Error: proxy speed test failed${RESET}"'
-NEW_PROXY_DISABLED='        echo -e "${YELLOW}${BOLD}Proxy speed test disabled.${RESET}"'
+NEW_LOGGER_SOURCE='. /usr/local/bin/runtime-log.sh'
+NEW_SIGNAL_TEXT='Stop requested. Cleaning up and exiting...'
+NEW_DIRECT_ERROR_TEXT='Error: direct speed test failed'
+NEW_DIRECT_DISABLED_TEXT='Direct speed test disabled.'
+NEW_PROXY_ERROR_TEXT='Error: proxy speed test failed'
+NEW_PROXY_DISABLED_TEXT='Proxy speed test disabled.'
+NEW_DOWNLOAD_START_TEXT='Starting URL download...'
+NEW_EMPTY_URL_TEXT='URL_DDL is empty. Download skipped.'
+NEW_INITIAL_TEXT='Starting in 5 seconds...'
 NEW_DIRECT_DOWNLOAD_ONLY='Starting direct speed test (download-only, ${TEST_DURATION} sec)'
 NEW_DIRECT_BOTH='Starting direct speed test (download and upload, ${TEST_DURATION} sec per direction)'
 NEW_PROXY_DOWNLOAD_ONLY='Starting speed test through proxychains4 (download-only, ${TEST_DURATION} sec)'
 NEW_PROXY_BOTH='Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec per direction)'
-NEW_DOWNLOAD_START='        echo -e "${BLUE}${BOLD}Starting URL download...${RESET}"'
-NEW_EMPTY_URL='        echo -e "${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}"'
-NEW_DIRECT_COMMAND='        if ! run_cf_speedtest_direct --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
-NEW_PROXY_COMMAND='        if ! run_cf_speedtest_proxy --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS"; then'
+NEW_DIRECT_COMMAND='        if ! run_cf_speedtest_direct --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS" --bytes-to-download "$SPEEDTEST_DOWNLOAD_BYTES" --bytes-to-upload "$SPEEDTEST_UPLOAD_BYTES"; then'
+NEW_PROXY_COMMAND='        if ! run_cf_speedtest_proxy --test-duration-seconds "$TEST_DURATION" --download-threads "$DOWNLOAD_THREADS" --upload-threads "$UPLOAD_THREADS" --bytes-to-download "$SPEEDTEST_DOWNLOAD_BYTES" --bytes-to-upload "$SPEEDTEST_UPLOAD_BYTES"; then'
 NEW_URL_COMMAND='        if ! run_url_download "$URL_DDL"; then'
 NEW_DIRECT_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_DIRECT:=false}"'
 NEW_PROXY_TOGGLE_DEFAULT=': "${RUN_SPEEDTEST_PROXY:=false}"'
-NEW_INITIAL='echo -e "${CYAN}${BOLD}Starting in 5 seconds...${RESET}"'
+NEW_INITIAL='runtime_log_info "${CYAN}${BOLD}Starting in 5 seconds...${RESET}"'
+
+assert_logger_message() {
+    local file=$1 symbol=$2 message=$3 label=$4 matches count
+    matches=$(grep -F -- "$message" "$file" || true)
+    count=$(printf '%s\n' "$matches" | grep -Fc -- "$message" || true)
+    if [ "$count" -ne 1 ]; then
+        fail "$label (expected one message line, got $count)"
+        return 1
+    fi
+    if ! printf '%s\n' "$matches" | grep -Fq -- "$symbol"; then
+        fail "$label is not emitted through $symbol"
+        return 1
+    fi
+}
+
+assert_colored_logger_message() {
+    local file=$1 symbol=$2 color=$3 message=$4 label=$5 line matches
+    matches=$(grep -F -- "$message" "$file" || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            *"$symbol"*"$color"*) return 0 ;;
+        esac
+    done <<<"$matches"
+    fail "$label does not place its color after $symbol"
+    return 1
+}
 
 assert_translated_messages() {
-    local file=$1 label=$2 forbidden
-    assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label English signal log" || return 1
-    assert_contains_file "$file" "$NEW_DIRECT_DOWNLOAD_ONLY" "$label direct download-only log" || return 1
-    assert_contains_file "$file" "$NEW_DIRECT_BOTH" "$label direct download-and-upload log" || return 1
-    assert_line_exactly_once "$file" "$NEW_DIRECT_ERROR" "$label English direct-error log" || return 1
-    assert_line_exactly_once "$file" "$NEW_DIRECT_DISABLED" "$label English direct-disabled log" || return 1
-    assert_contains_file "$file" "$NEW_PROXY_DOWNLOAD_ONLY" "$label proxy download-only log" || return 1
-    assert_contains_file "$file" "$NEW_PROXY_BOTH" "$label proxy download-and-upload log" || return 1
-    assert_line_exactly_once "$file" "$NEW_PROXY_ERROR" "$label English proxy-error log" || return 1
-    assert_line_exactly_once "$file" "$NEW_PROXY_DISABLED" "$label English proxy-disabled log" || return 1
-    assert_line_exactly_once "$file" "$NEW_DOWNLOAD_START" "$label English download-start log" || return 1
-    assert_line_exactly_once "$file" "$NEW_EMPTY_URL" "$label English empty-URL log" || return 1
-    assert_line_exactly_once "$file" "$NEW_INITIAL" "$label English initial log" || return 1
+    local file=$1 label=$2 forbidden direct_printf line
+    assert_logger_message "$file" runtime_log_info "$NEW_SIGNAL_TEXT" "$label signal log" || return 1
+    assert_logger_message "$file" runtime_log_error "$NEW_DIRECT_ERROR_TEXT" "$label direct-error log" || return 1
+    assert_logger_message "$file" runtime_log_warning "$NEW_DIRECT_DISABLED_TEXT" "$label direct-disabled log" || return 1
+    assert_logger_message "$file" runtime_log_error "$NEW_PROXY_ERROR_TEXT" "$label proxy-error log" || return 1
+    assert_logger_message "$file" runtime_log_warning "$NEW_PROXY_DISABLED_TEXT" "$label proxy-disabled log" || return 1
+    assert_logger_message "$file" runtime_log_info "$NEW_DOWNLOAD_START_TEXT" "$label download-start log" || return 1
+    assert_logger_message "$file" runtime_log_warning "$NEW_EMPTY_URL_TEXT" "$label empty-URL log" || return 1
+    assert_logger_message "$file" runtime_log_info "$NEW_INITIAL_TEXT" "$label initial log" || return 1
+    assert_logger_message "$file" runtime_log_error 'Error: URL download failed; continuing.' "$label URL-error log" || return 1
+    assert_logger_message "$file" runtime_log_error 'Error: failed to write proxy configuration.' "$label proxy-config-error log" || return 1
+
+    for message in "$NEW_DIRECT_DOWNLOAD_ONLY" "$NEW_DIRECT_BOTH"; do
+        assert_logger_message "$file" runtime_log_info "$message" "$label direct start log" || return 1
+    done
+    for message in "$NEW_PROXY_DOWNLOAD_ONLY" "$NEW_PROXY_BOTH"; do
+        assert_logger_message "$file" runtime_log_info "$message" "$label proxy start log" || return 1
+    done
+
+    assert_colored_logger_message "$file" runtime_log_info '${GREEN}' "$NEW_DIRECT_DOWNLOAD_ONLY" "$label direct download-only color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_info '${GREEN}' "$NEW_DIRECT_BOTH" "$label direct both-direction color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_error '${RED}' "$NEW_DIRECT_ERROR_TEXT" "$label direct error color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_warning '${YELLOW}' "$NEW_DIRECT_DISABLED_TEXT" "$label direct disabled color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_info '${BLUE}' "$NEW_PROXY_DOWNLOAD_ONLY" "$label proxy download-only color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_info '${BLUE}' "$NEW_PROXY_BOTH" "$label proxy both-direction color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_error '${RED}' "$NEW_PROXY_ERROR_TEXT" "$label proxy error color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_warning '${YELLOW}' "$NEW_PROXY_DISABLED_TEXT" "$label proxy disabled color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_info '${BLUE}' "$NEW_DOWNLOAD_START_TEXT" "$label URL start color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_warning '${YELLOW}' "$NEW_EMPTY_URL_TEXT" "$label empty URL color order" || return 1
+    assert_colored_logger_message "$file" runtime_log_info '${CYAN}' "$NEW_INITIAL_TEXT" "$label initial color order" || return 1
+
+    if grep -nF -- 'echo -e' "$file"; then
+        fail "$label still contains a direct generated echo"
+        return 1
+    fi
+    if grep -nE 'runtime_log_(info|warning|error).*cf_speedtest|cf_speedtest.*runtime_log_(info|warning|error)' "$file"; then
+        fail "$label wraps cf_speedtest child output in the runtime logger"
+        return 1
+    fi
+    direct_printf=$(grep -nE '^[[:space:]]*printf[[:space:]]' "$file" || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            *'/etc/proxychains4.conf'*) ;;
+            *)
+                fail "$label contains a direct generated printf: $line"
+                return 1
+                ;;
+        esac
+    done <<<"$direct_printf"
+
     for forbidden in \
         "$OLD_SIGNAL_TEXT" \
         "$OLD_DIRECT_START_TEXT" \
@@ -194,8 +263,10 @@ assert_translated_messages() {
     done
 }
 
+
 assert_generated_runtime_anchors() {
-    local file=$1 label=$2 config_guard_line direct_function_line proxy_function_line download_function_line
+    local file=$1 label=$2 config_guard_line direct_function_line proxy_function_line download_function_line logger_source_line random_source_line network_source_line
+    assert_line_exactly_once "$file" "$NEW_LOGGER_SOURCE" "$label runtime logger source count" || return 1
     assert_line_exactly_once "$file" '. /usr/local/bin/random-wait.sh' "$label random helper source count" || return 1
     assert_line_exactly_once "$file" '. /usr/local/bin/network-runtime.sh' "$label network helper source count" || return 1
     assert_line_exactly_once "$file" 'if ! validate_wait_config; then' "$label wait preflight count" || return 1
@@ -206,7 +277,10 @@ assert_generated_runtime_anchors() {
     assert_line_exactly_once "$file" '        printf "strict_chain\nquiet_mode\nproxy_dns\nremote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n[ProxyList]\n%s\n" "$PROXY_CONFIG" > /etc/proxychains4.conf &&' "$label literal config write guard" || return 1
     assert_line_exactly_once "$file" '            chmod 0600 -- /etc/proxychains4.conf' "$label config mode count" || return 1
     assert_line_exactly_once "$file" '    ); then' "$label config failure branch" || return 1
-    assert_line_exactly_once "$file" "        printf '%s\\n' 'Error: failed to write proxy configuration.' >&2" "$label config failure diagnostic" || return 1
+    assert_logger_message "$file" runtime_log_error 'Error: failed to write proxy configuration.' "$label config failure diagnostic" || return 1
+    logger_source_line=$(grep -nF -- "$NEW_LOGGER_SOURCE" "$file" | cut -d: -f1)
+    random_source_line=$(grep -nF -- '. /usr/local/bin/random-wait.sh' "$file" | cut -d: -f1)
+    network_source_line=$(grep -nF -- '. /usr/local/bin/network-runtime.sh' "$file" | cut -d: -f1)
     config_guard_line=$(grep -nF -- 'if [[ -n ${PROXY_CONFIG:-} ]]; then' "$file" | cut -d: -f1)
     direct_function_line=$(grep -nF -- 'run_speedtest_direct() {' "$file" | cut -d: -f1)
     proxy_function_line=$(grep -nF -- 'run_speedtest_proxy() {' "$file" | cut -d: -f1)
@@ -219,8 +293,15 @@ assert_generated_runtime_anchors() {
         fail "$label proxy config failure gate is not before speedtest/download code"
         return 1
     fi
+    if [ -z "$logger_source_line" ] || [ -z "$random_source_line" ] ||
+        [ -z "$network_source_line" ] ||
+        [ "$logger_source_line" -ge "$random_source_line" ] ||
+        [ "$random_source_line" -ge "$network_source_line" ]; then
+        fail "$label runtime logger was not sourced before both helpers"
+        return 1
+    fi
     assert_line_exactly_once "$file" 'wait_for_initial_start' "$label initial wait helper count" || return 1
-    assert_line_exactly_once "$file" "$NEW_SIGNAL" "$label signal trap count" || return 1
+    assert_logger_message "$file" runtime_log_info "$NEW_SIGNAL_TEXT" "$label signal trap count" || return 1
     assert_line_exactly_once "$file" "$NEW_DIRECT_COMMAND" "$label direct helper command count" || return 1
     assert_line_exactly_once "$file" "$NEW_PROXY_COMMAND" "$label proxy helper command count" || return 1
     assert_line_exactly_once "$file" "$NEW_URL_COMMAND" "$label URL helper command count" || return 1
