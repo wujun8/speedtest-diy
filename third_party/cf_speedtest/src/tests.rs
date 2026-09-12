@@ -1,5 +1,6 @@
 use super::*;
 use chrono::{DateTime, Utc};
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -830,4 +831,313 @@ fn upload_once_preserves_retry_after_from_local_429() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].header("content-length"), Some("9"));
     assert_eq!(requests[0].body, vec![1u8; 9]);
+}
+
+#[test]
+fn runtime_request_gate_spaces_starts_and_rechecks_a_retry_deadline_during_wait() {
+    let gate = RuntimeRequestGate::new();
+    let now_ms = Cell::new(0_u64);
+
+    let first_start = gate.wait_for_start_with(|| now_ms.get(), |_| {});
+    assert_eq!(first_start, 0);
+
+    let second_start = gate.wait_for_start_with(|| now_ms.get(), |delay_ms| {
+        now_ms.set(now_ms.get().saturating_add(delay_ms));
+    });
+    assert!(second_start >= first_start + 250);
+
+    let retry_gate = RuntimeRequestGate::new();
+    let retry_now_ms = Cell::new(0_u64);
+    assert_eq!(
+        retry_gate.wait_for_start_with(|| retry_now_ms.get(), |_| {}),
+        0
+    );
+
+    let mut sleep_log = Vec::new();
+    let retry_extended = Cell::new(false);
+    let delayed_start = retry_gate.wait_for_start_with(
+        || retry_now_ms.get(),
+        |delay_ms| {
+            sleep_log.push(delay_ms);
+            if !retry_extended.replace(true) {
+                retry_gate.extend_retry_deadline_ms(1_000);
+            }
+            retry_now_ms.set(retry_now_ms.get().saturating_add(delay_ms));
+        },
+    );
+
+    assert!(delayed_start >= 1_000);
+    assert!(sleep_log.len() >= 2);
+    assert!(retry_extended.get());
+}
+
+#[test]
+fn direction_state_counts_only_successful_samples_and_preserves_the_first_terminal_error() {
+    let first_sample = TransferSample {
+        bytes: 12,
+        bytes_per_second: 120,
+    };
+    let second_sample = TransferSample {
+        bytes: 7,
+        bytes_per_second: 70,
+    };
+    let mut state = DirectionState::default();
+    state.record_sample(first_sample);
+    state.record_sample(second_sample);
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.valid_sample_count, 2);
+    assert_eq!(snapshot.confirmed_bytes, 19);
+    assert_eq!(snapshot.measurements, vec![first_sample, second_sample]);
+    assert_eq!(snapshot.terminal_error, None);
+    assert!(!state.should_stop());
+
+    let terminal_failures = vec![
+        AttemptFailure::InvalidBodyLength {
+            expected: 8,
+            actual: 7,
+        },
+        AttemptFailure::RateLimited(Some("1".to_string())),
+        AttemptFailure::HttpStatus(503),
+        AttemptFailure::Transport,
+    ];
+    for failure in terminal_failures {
+        let mut failed_state = DirectionState::default();
+        failed_state.record_terminal_error(failure.clone());
+        let failed_snapshot = failed_state.snapshot();
+
+        assert_eq!(failed_snapshot.valid_sample_count, 0);
+        assert_eq!(failed_snapshot.confirmed_bytes, 0);
+        assert!(failed_snapshot.measurements.is_empty());
+        assert_eq!(failed_snapshot.terminal_error, Some(failure));
+        assert!(failed_state.should_stop());
+    }
+
+    let first_error = AttemptFailure::HttpStatus(503);
+    let later_error = AttemptFailure::Transport;
+    state.record_terminal_error(first_error.clone());
+    state.record_terminal_error(later_error);
+    let terminal_snapshot = state.snapshot();
+    assert_eq!(terminal_snapshot.terminal_error, Some(first_error));
+    assert!(state.should_stop());
+}
+
+fn assert_direction_run_result(
+    result: DirectionRunResult,
+    expected_exit_code: i32,
+    expected_success_table: bool,
+) {
+    assert_eq!(result.exit_code(), expected_exit_code);
+    assert_eq!(result.has_success_table(), expected_success_table);
+}
+
+#[test]
+fn direction_run_classification_distinguishes_zero_samples_errors_and_complete_success() {
+    let empty_download = DirectionState::default();
+    let empty_upload = DirectionState::default();
+
+    for requested in [Direction::Download, Direction::Upload, Direction::Both] {
+        assert_direction_run_result(
+            classify_direction_run_result(requested, &empty_download, &empty_upload),
+            3,
+            false,
+        );
+    }
+
+    let mut download_with_error = DirectionState::default();
+    download_with_error.record_sample(TransferSample {
+        bytes: 4,
+        bytes_per_second: 40,
+    });
+    download_with_error.record_terminal_error(AttemptFailure::HttpStatus(503));
+    assert_direction_run_result(
+        classify_direction_run_result(Direction::Download, &download_with_error, &empty_upload),
+        1,
+        false,
+    );
+
+    let mut upload_with_error = DirectionState::default();
+    upload_with_error.record_sample(TransferSample {
+        bytes: 5,
+        bytes_per_second: 50,
+    });
+    upload_with_error.record_terminal_error(AttemptFailure::Transport);
+    assert_direction_run_result(
+        classify_direction_run_result(Direction::Upload, &empty_download, &upload_with_error),
+        1,
+        false,
+    );
+
+    assert_direction_run_result(
+        classify_direction_run_result(
+            Direction::Both,
+            &download_with_error,
+            &upload_with_error,
+        ),
+        1,
+        false,
+    );
+
+    let mut successful_download = DirectionState::default();
+    successful_download.record_sample(TransferSample {
+        bytes: 8,
+        bytes_per_second: 80,
+    });
+    let mut successful_upload = DirectionState::default();
+    successful_upload.record_sample(TransferSample {
+        bytes: 9,
+        bytes_per_second: 90,
+    });
+
+    assert_direction_run_result(
+        classify_direction_run_result(Direction::Download, &successful_download, &empty_upload),
+        0,
+        true,
+    );
+    assert_direction_run_result(
+        classify_direction_run_result(Direction::Upload, &empty_download, &successful_upload),
+        0,
+        true,
+    );
+    assert_direction_run_result(
+        classify_direction_run_result(
+            Direction::Both,
+            &successful_download,
+            &successful_upload,
+        ),
+        0,
+        true,
+    );
+}
+
+#[test]
+fn worker_cycle_composes_shared_gate_and_retry_without_real_sleep() {
+    let gate = RuntimeRequestGate::new();
+    let now_ms = Cell::new(0_u64);
+    let attempt_count = Cell::new(0_usize);
+    let attempt_ids = RefCell::new(Vec::new());
+    let attempt_times = RefCell::new(Vec::new());
+    let sleep_log = RefCell::new(Vec::new());
+    let successful_sample = TransferSample {
+        bytes: 16,
+        bytes_per_second: 160,
+    };
+    let mut state = DirectionState::default();
+
+    let _ = run_worker_cycle(
+        &mut state,
+        &gate,
+        |attempt_id| {
+            attempt_ids.borrow_mut().push(attempt_id);
+            attempt_times.borrow_mut().push(now_ms.get());
+            let attempt_index = attempt_count.get();
+            attempt_count.set(attempt_index + 1);
+            match attempt_index {
+                0 => Err(AttemptFailure::RateLimited(Some("1".to_string()))),
+                1 => Ok(successful_sample),
+                _ => panic!("429 followed by success must perform exactly two attempts"),
+            }
+        },
+        || now_ms.get(),
+        |delay_ms| {
+            sleep_log.borrow_mut().push(delay_ms);
+            now_ms.set(now_ms.get().saturating_add(delay_ms));
+        },
+    );
+
+    let attempt_ids = attempt_ids.into_inner();
+    let attempt_times = attempt_times.into_inner();
+    let sleep_log = sleep_log.into_inner();
+    let snapshot = state.snapshot();
+
+    assert_eq!(attempt_count.get(), 2);
+    assert_eq!(attempt_ids.len(), 2);
+    assert!(attempt_ids.iter().all(|attempt_id| *attempt_id != 0));
+    assert_eq!(
+        attempt_ids.iter().copied().collect::<HashSet<_>>().len(),
+        2
+    );
+    assert_eq!(attempt_times.len(), 2);
+    assert!(attempt_times[1] >= 1_000);
+    assert_eq!(sleep_log, vec![1_000]);
+    assert_eq!(snapshot.valid_sample_count, 1);
+    assert_eq!(snapshot.confirmed_bytes, successful_sample.bytes);
+    assert_eq!(snapshot.measurements, vec![successful_sample]);
+    assert_eq!(snapshot.terminal_error, None);
+    assert!(!state.should_stop());
+}
+
+#[test]
+fn terminal_worker_cycle_stops_future_cycles_without_issuing_more_requests() {
+    let gate = RuntimeRequestGate::new();
+    let now_ms = Cell::new(0_u64);
+    let first_request_count = Cell::new(0_usize);
+    let mut state = DirectionState::default();
+
+    let _ = run_worker_cycle(
+        &mut state,
+        &gate,
+        |_attempt_id| {
+            first_request_count.set(first_request_count.get() + 1);
+            Err(AttemptFailure::HttpStatus(503))
+        },
+        || now_ms.get(),
+        |_delay_ms| panic!("terminal HTTP status must not sleep"),
+    );
+
+    assert_eq!(first_request_count.get(), 1);
+    assert!(state.should_stop());
+    let first_snapshot = state.snapshot();
+    assert_eq!(first_snapshot.valid_sample_count, 0);
+    assert_eq!(first_snapshot.confirmed_bytes, 0);
+    assert!(first_snapshot.measurements.is_empty());
+    assert_eq!(
+        first_snapshot.terminal_error,
+        Some(AttemptFailure::HttpStatus(503))
+    );
+
+    let second_request_count = Cell::new(0_usize);
+    let _ = run_worker_cycle(
+        &mut state,
+        &gate,
+        |_attempt_id| {
+            second_request_count.set(second_request_count.get() + 1);
+            Ok(TransferSample {
+                bytes: 32,
+                bytes_per_second: 320,
+            })
+        },
+        || now_ms.get(),
+        |_delay_ms| panic!("a stopped worker cycle must not sleep"),
+    );
+
+    assert_eq!(second_request_count.get(), 0);
+    assert_eq!(state.snapshot().terminal_error, Some(AttemptFailure::HttpStatus(503)));
+}
+
+#[test]
+fn retry_after_deadline_is_shared_by_two_logical_workers_in_virtual_time() {
+    let gate = RuntimeRequestGate::new();
+    let now_ms = Cell::new(0_u64);
+    let first_worker_start = gate.wait_for_start_with(|| now_ms.get(), |_| {});
+    assert_eq!(first_worker_start, 0);
+
+    let retry_deadline_ms = 1_000;
+    now_ms.set(250);
+    gate.extend_retry_deadline_ms(retry_deadline_ms);
+
+    let mut sleep_log = Vec::new();
+    let second_worker_start = gate.wait_for_start_with(
+        || now_ms.get(),
+        |delay_ms| {
+            sleep_log.push(delay_ms);
+            now_ms.set(now_ms.get().saturating_add(delay_ms));
+        },
+    );
+    let second_worker_issue_time = now_ms.get();
+
+    assert!(second_worker_start >= retry_deadline_ms);
+    assert_eq!(second_worker_issue_time, second_worker_start);
+    assert!(second_worker_issue_time >= retry_deadline_ms);
+    assert_eq!(sleep_log, vec![750]);
 }
