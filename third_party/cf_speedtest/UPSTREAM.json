@@ -1,0 +1,26 @@
+{
+  "upstream": {
+    "repository": "https://github.com/12932/cf_speedtest",
+    "commit": "7824731cc7c448a0cffa12d7a20cd4d7daa25b63",
+    "tree": "69e019aeaca727b9ca485deb11c4bfd1903b4a0b",
+    "version": "0.5.2",
+    "license": "MIT"
+  },
+  "excluded": {
+    ".cargo/config.toml": {
+      "reason": "Upstream enables target-cpu=native, which is inappropriate for a reproducible x86-64 container build.",
+      "sha256": "59a8c63e78a3524907d28ece7b3a0fc308c61e4333c063a56391d39bcb08545c"
+    }
+  },
+  "files": {
+    "Cargo.lock": "ccb16eb9c6a5c5d2496a712b91c413d1f837f07629d0928201ee0e49ddb9f3b3",
+    "Cargo.toml": "5ee21e80787bc048d5b927e321e36b4d35b747c7cce1be939c172c2743c09cc2",
+    "LICENSE.txt": "eb948c58d109257be5aac135afd8be19607a796ab1a19e8d1e4072e237f215f9",
+    "README.md": "332c708dad5c38601896b03d0aeb82e7a8e89b971e0b195c2caf3fc46d90e888",
+    "src/agent.rs": "d1a81f96e672e0106f1285e8ff8d1560b08777695adc3771225dd981a08ce84c",
+    "src/args.rs": "6a53263fd3b38756da42b31d6f103767d29d0ae00e06aabee42d8393dd08376b",
+    "src/locations.rs": "4892faab44b4c25d50afcc00112f48e9c976e2d428c1d43e2be8f8b1cb24efdb",
+    "src/main.rs": "cb0fb1403bfcdf9fddfebf2f9d6e2d3b1ed9a877b87dc0165c2783119a8e44ae",
+    "src/tests.rs": "a3083f5939895ab26296e70e8a046c1bb51eaad0e519e3ee241828e3ad091ed8"
+  }
+}
