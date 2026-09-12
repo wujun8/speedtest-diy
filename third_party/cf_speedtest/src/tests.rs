@@ -196,6 +196,15 @@ fn download_sample_is_valid_only_when_body_length_exactly_matches_request() {
 }
 
 #[test]
+fn production_upload_streams_the_configured_body_without_a_request_sized_vec() {
+    let source = include_str!("main.rs");
+
+    assert!(!source.contains("let body = vec![1u8; requested_bytes]"));
+    assert!(source.contains("ureq::SendBody::from_owned_reader(UploadHelper"));
+    assert!(source.contains(".header(\"Content-Length\", requested_bytes.to_string())"));
+}
+
+#[test]
 fn upload_helper_emits_exactly_requested_bytes_when_buffer_is_larger() {
     let requested = 9;
     let byte_ctr = Arc::new(AtomicUsize::new(0));
