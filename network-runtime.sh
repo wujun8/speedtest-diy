@@ -2,6 +2,16 @@
 
 # Sourceable network runtime helpers. Sourcing this file performs no network I/O.
 
+if ! declare -F runtime_log_error >/dev/null 2>&1 ||
+    ! declare -F runtime_log_info >/dev/null 2>&1 ||
+    ! declare -F runtime_log_warning >/dev/null 2>&1; then
+  printf '%s\n' 'network-runtime.sh: source runtime-log.sh before network-runtime.sh' >&2
+  if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    exit 1
+  fi
+  return 1
+fi
+
 _NR_RUNTIME_DIR=
 _NR_ACTIVE_PIDS=()
 _NR_LAST_PID=
@@ -12,8 +22,8 @@ _nr_create_runtime_dir() {
   local tmpdir=${TMPDIR:-/tmp}
   local runtime_dir
 
-  if ! runtime_dir=$(umask 077; mktemp -d "$tmpdir/network-runtime.XXXXXX"); then
-    printf 'ERROR: could not create private network runtime metadata directory.\n' >&2
+  if ! runtime_dir=$(umask 077; mktemp -d "$tmpdir/network-runtime.XXXXXX" 2>/dev/null); then
+    runtime_log_error 'ERROR: could not create private network runtime metadata directory.'
     return 1
   fi
   printf '%s\n' "$runtime_dir"
@@ -46,7 +56,9 @@ _nr_pid_running() {
     return 1
   fi
   if [[ -r /proc/$pid/stat ]]; then
-    proc_stat=$(<"/proc/$pid/stat") || return 0
+    if ! IFS= read -r proc_stat 2>/dev/null <"/proc/$pid/stat"; then
+      return 1
+    fi
     proc_stat=${proc_stat##*) }
     state=${proc_stat%% *}
     if [[ $state == Z ]]; then
@@ -157,6 +169,27 @@ _nr_normalize_decimal() {
   printf '%s\n' "$value"
 }
 
+_nr_validate_byte_count() {
+  local name=$1
+  local raw=${2-}
+  local canonical
+
+  if [[ -z $raw || ! $raw =~ ^[0-9]+$ ]]; then
+    runtime_log_error "ERROR: invalid $name; expected a decimal integer from 1 to 2147483647."
+    return 2
+  fi
+  if ! canonical=$(_nr_normalize_decimal "$raw"); then
+    runtime_log_error "ERROR: invalid $name; expected a decimal integer from 1 to 2147483647."
+    return 2
+  fi
+  if [[ $canonical == 0 || ${#canonical} -gt 10 ||
+        ( ${#canonical} -eq 10 && $canonical > 2147483647 ) ]]; then
+    runtime_log_error "ERROR: invalid $name; expected a decimal integer from 1 to 2147483647."
+    return 2
+  fi
+  printf '%s\n' "$canonical"
+}
+
 _nr_validate_signed_max_decimal() {
   local value=$1
 
@@ -177,16 +210,16 @@ validate_network_runtime_config() {
   else
     raw=$DOWNLOAD_THREADS
     if [[ ! $raw =~ ^[0-9]+$ ]]; then
-      printf 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.\n' >&2
+      runtime_log_error 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.'
       return 2
     fi
     if ! canonical=$(_nr_normalize_decimal "$raw"); then
-      printf 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.\n' >&2
+      runtime_log_error 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.'
       return 2
     fi
     if [[ $canonical == 0 || ${#canonical} -gt 2 || \
           ( ${#canonical} -eq 2 && $canonical > 64 ) ]]; then
-      printf 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.\n' >&2
+      runtime_log_error 'ERROR: invalid DOWNLOAD_THREADS; expected a decimal integer from 1 to 64.'
       return 2
     fi
     DOWNLOAD_THREADS=$((10#$canonical))
@@ -197,10 +230,27 @@ validate_network_runtime_config() {
   else
     mode=$SPEEDTEST_DOWNLOAD_ONLY
     if [[ $mode != true && $mode != false ]]; then
-      printf 'ERROR: invalid SPEEDTEST_DOWNLOAD_ONLY; expected exact true or false.\n' >&2
+      runtime_log_error 'ERROR: invalid SPEEDTEST_DOWNLOAD_ONLY; expected exact true or false.'
       return 2
     fi
   fi
+
+  if [[ ${SPEEDTEST_DOWNLOAD_BYTES+x} != x ]]; then
+    SPEEDTEST_DOWNLOAD_BYTES=10485760
+  elif ! canonical=$(_nr_validate_byte_count SPEEDTEST_DOWNLOAD_BYTES "$SPEEDTEST_DOWNLOAD_BYTES"); then
+    return 2
+  else
+    SPEEDTEST_DOWNLOAD_BYTES=$canonical
+  fi
+
+  if [[ ${SPEEDTEST_UPLOAD_BYTES+x} != x ]]; then
+    SPEEDTEST_UPLOAD_BYTES=10485760
+  elif ! canonical=$(_nr_validate_byte_count SPEEDTEST_UPLOAD_BYTES "$SPEEDTEST_UPLOAD_BYTES"); then
+    return 2
+  else
+    SPEEDTEST_UPLOAD_BYTES=$canonical
+  fi
+
   return 0
 }
 
@@ -222,6 +272,7 @@ _nr_start_curl() {
   local -a clear_proxy_env
   local pid
   local prior_pid
+  local diagnostic_file
 
   clear_proxy_env=(
     env
@@ -245,14 +296,16 @@ _nr_start_curl() {
     --
     "$url"
   )
+  diagnostic_file=${metadata_file}.stderr
+  _nr_remove_files "$diagnostic_file"
 
   prior_pid=${!:-}
   _NR_START_PREV_PID=$prior_pid
   _NR_START_IN_PROGRESS=1
   if [[ -n ${PROXY_CONFIG:-} ]]; then
-    "${clear_proxy_env[@]}" proxychains4 curl "${curl_args[@]}" >"$metadata_file" &
+    "${clear_proxy_env[@]}" proxychains4 curl "${curl_args[@]}" >"$metadata_file" 2>"$diagnostic_file" &
   else
-    "${clear_proxy_env[@]}" curl "${curl_args[@]}" >"$metadata_file" &
+    "${clear_proxy_env[@]}" curl "${curl_args[@]}" >"$metadata_file" 2>"$diagnostic_file" &
   fi
   pid=$!
   _NR_ACTIVE_PIDS+=("$pid")
@@ -275,11 +328,22 @@ _nr_forget_pid() {
 
 _nr_wait_curl() {
   local pid=${1-}
+  local metadata_file=${2-}
+  local diagnostic_file diagnostics
   local rc
 
   [[ -n $pid ]] || return 1
   wait "$pid"
   rc=$?
+  if [[ -n $metadata_file ]]; then
+    diagnostic_file=${metadata_file}.stderr
+    if [[ -s $diagnostic_file ]]; then
+      diagnostics=$(<"$diagnostic_file") || diagnostics=
+      if [[ -n $diagnostics ]]; then
+        runtime_log_error "curl: $diagnostics" || :
+      fi
+    fi
+  fi
   _nr_forget_pid "$pid"
   return "$rc"
 }
@@ -289,12 +353,12 @@ _nr_parse_curl_metadata() {
   local metadata
 
   if [[ ! -f $metadata_file ]]; then
-    printf 'ERROR: curl did not produce HTTP metadata.\n' >&2
+    runtime_log_error 'ERROR: curl did not produce HTTP metadata.'
     return 1
   fi
   metadata=$(<"$metadata_file")
   if [[ ! $metadata =~ ^([0-9][0-9][0-9])$'\t'([0-9]+)$ ]]; then
-    printf 'ERROR: curl produced malformed HTTP metadata.\n' >&2
+    runtime_log_error 'ERROR: curl produced malformed HTTP metadata.'
     return 1
   fi
   printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
@@ -345,22 +409,22 @@ _nr_validate_probe_response() {
   meta_status=${metadata%%$'\t'*}
   meta_size=${metadata#*$'\t'}
   if [[ $meta_status != 206 || $meta_size != 1 ]]; then
-    printf 'ERROR: Range probe requires final HTTP 206 with size_download 1.\n' >&2
+    runtime_log_error 'ERROR: Range probe requires final HTTP 206 with size_download 1.'
     return 1
   fi
 
   if ! header_metadata=$(_nr_final_header_metadata "$header_file"); then
-    printf 'ERROR: Range probe response headers are missing or malformed.\n' >&2
+    runtime_log_error 'ERROR: Range probe response headers are missing or malformed.'
     return 1
   fi
   header_status=${header_metadata%%$'\t'*}
   content_range=${header_metadata#*$'\t'}
   if [[ $header_status != 206 ]]; then
-    printf 'ERROR: Range probe final HTTP status was not 206.\n' >&2
+    runtime_log_error 'ERROR: Range probe final HTTP status was not 206.'
     return 1
   fi
   if [[ ! $content_range =~ ^bytes[[:space:]]+([0-9]+)-([0-9]+)/([0-9]+)$ ]]; then
-    printf 'ERROR: Range probe Content-Range is malformed.\n' >&2
+    runtime_log_error 'ERROR: Range probe Content-Range is malformed.'
     return 1
   fi
   raw_start=${BASH_REMATCH[1]}
@@ -369,19 +433,19 @@ _nr_validate_probe_response() {
   if ! raw_start=$(_nr_normalize_decimal "$raw_start") || \
      ! raw_end=$(_nr_normalize_decimal "$raw_end") || \
      ! total=$(_nr_normalize_decimal "$raw_total"); then
-    printf 'ERROR: Range probe Content-Range contains an invalid decimal value.\n' >&2
+    runtime_log_error 'ERROR: Range probe Content-Range contains an invalid decimal value.'
     return 1
   fi
   if ! _nr_validate_signed_max_decimal "$total"; then
-    printf 'ERROR: Range probe total exceeds the signed 64-bit maximum.\n' >&2
+    runtime_log_error 'ERROR: Range probe total exceeds the signed 64-bit maximum.'
     return 1
   fi
   if [[ $raw_start != 0 || $raw_end != 0 ]]; then
-    printf 'ERROR: Range probe Content-Range was not exactly bytes 0-0/TOTAL.\n' >&2
+    runtime_log_error 'ERROR: Range probe Content-Range was not exactly bytes 0-0/TOTAL.'
     return 1
   fi
   if [[ $total == 0 || $total == 1 ]]; then
-    printf 'ERROR: Range probe reported a total length of %s; segmented download requires more than 1 byte.\n' "$total" >&2
+    runtime_log_error "ERROR: Range probe reported a total length of $total; segmented download requires more than 1 byte."
     return 1
   fi
   printf '%s\n' "$total"
@@ -403,26 +467,22 @@ _nr_validate_segment_response() {
   meta_size=${metadata#*$'\t'}
   expected_size=$((expected_end - expected_start + 1))
   if [[ $meta_status != 206 || $meta_size != "$expected_size" ]]; then
-    printf 'ERROR: segment bytes %s-%s requires final HTTP 206 and size_download %s.\n' \
-      "$expected_start" "$expected_end" "$expected_size" >&2
+    runtime_log_error "ERROR: segment bytes $expected_start-$expected_end requires final HTTP 206 and size_download $expected_size."
     return 1
   fi
 
   if ! header_metadata=$(_nr_final_header_metadata "$header_file"); then
-    printf 'ERROR: segment bytes %s-%s response headers are missing or malformed.\n' \
-      "$expected_start" "$expected_end" >&2
+    runtime_log_error "ERROR: segment bytes $expected_start-$expected_end response headers are missing or malformed."
     return 1
   fi
   header_status=${header_metadata%%$'\t'*}
   content_range=${header_metadata#*$'\t'}
   if [[ $header_status != 206 ]]; then
-    printf 'ERROR: segment bytes %s-%s final HTTP status was not 206.\n' \
-      "$expected_start" "$expected_end" >&2
+    runtime_log_error "ERROR: segment bytes $expected_start-$expected_end final HTTP status was not 206."
     return 1
   fi
   if [[ ! $content_range =~ ^bytes[[:space:]]+([0-9]+)-([0-9]+)/([0-9]+)$ ]]; then
-    printf 'ERROR: segment bytes %s-%s Content-Range is malformed.\n' \
-      "$expected_start" "$expected_end" >&2
+    runtime_log_error "ERROR: segment bytes $expected_start-$expected_end Content-Range is malformed."
     return 1
   fi
   raw_start=${BASH_REMATCH[1]}
@@ -431,14 +491,12 @@ _nr_validate_segment_response() {
   if ! actual_start=$(_nr_normalize_decimal "$raw_start") || \
      ! actual_end=$(_nr_normalize_decimal "$raw_end") || \
      ! actual_total=$(_nr_normalize_decimal "$raw_total"); then
-    printf 'ERROR: segment bytes %s-%s Content-Range contains an invalid decimal value.\n' \
-      "$expected_start" "$expected_end" >&2
+    runtime_log_error "ERROR: segment bytes $expected_start-$expected_end Content-Range contains an invalid decimal value."
     return 1
   fi
   if [[ $actual_start != "$expected_start" || $actual_end != "$expected_end" || \
         $actual_total != "$expected_total" ]]; then
-    printf 'ERROR: segment Content-Range mismatch; expected bytes %s-%s/%s.\n' \
-      "$expected_start" "$expected_end" "$expected_total" >&2
+    runtime_log_error "ERROR: segment Content-Range mismatch; expected bytes $expected_start-$expected_end/$expected_total."
     return 1
   fi
   return 0
@@ -455,7 +513,7 @@ run_url_download() {
   local -a pids=() segment_headers=() segment_metadata=() segment_starts=() segment_ends=()
 
   if [[ -z $url ]]; then
-    printf 'URL download skipped: URL is empty.\n'
+    runtime_log_info 'URL download skipped: URL is empty.'
     return 0
   fi
   if ! validate_network_runtime_config; then
@@ -478,19 +536,18 @@ run_url_download() {
     _nr_remove_files "$full_header" "$full_metadata"
     _nr_start_curl "$full_header" "$full_metadata" "$url" ''
     transfer_pid=$_NR_LAST_PID
-    if ! _nr_wait_curl "$transfer_pid"; then
+    if ! _nr_wait_curl "$transfer_pid" "$full_metadata"; then
       _nr_cleanup_runtime
-      printf 'ERROR: complete URL download failed.\n' >&2
+      runtime_log_error 'ERROR: complete URL download failed.'
       return 1
     fi
     if ! total=$(_nr_validate_full_response "$full_metadata"); then
       _nr_cleanup_runtime
-      printf 'ERROR: complete URL download returned invalid HTTP metadata.\n' >&2
+      runtime_log_error 'ERROR: complete URL download returned invalid HTTP metadata.'
       return 1
     fi
     _nr_cleanup_runtime
-    printf 'URL download complete: total bytes=%s, concurrent segments=1, transport=%s\n' \
-      "$total" "$transport"
+    runtime_log_info "URL download complete: total bytes=$total, concurrent segments=1, transport=$transport"
     return 0
   fi
 
@@ -499,14 +556,14 @@ run_url_download() {
   _nr_remove_files "$probe_header" "$probe_metadata"
   _nr_start_curl "$probe_header" "$probe_metadata" "$url" '0-0'
   transfer_pid=$_NR_LAST_PID
-  if ! _nr_wait_curl "$transfer_pid"; then
+  if ! _nr_wait_curl "$transfer_pid" "$probe_metadata"; then
     _nr_cleanup_runtime
-    printf 'ERROR: Range probe curl command failed; refusing segmented download.\n' >&2
+    runtime_log_error 'ERROR: Range probe curl command failed; refusing segmented download.'
     return 1
   fi
   if ! total=$(_nr_validate_probe_response "$probe_header" "$probe_metadata"); then
     _nr_cleanup_runtime
-    printf 'ERROR: Range probe validation failed; refusing segmented download.\n' >&2
+    runtime_log_error 'ERROR: Range probe validation failed; refusing segmented download.'
     return 1
   fi
   _nr_remove_files "$probe_header" "$probe_metadata"
@@ -539,14 +596,14 @@ run_url_download() {
 
   for ((i = 0; i < segment_count; i++)); do
     pid=${pids[i]}
-    if _nr_wait_curl "$pid"; then
+    if _nr_wait_curl "$pid" "${segment_metadata[i]}"; then
       if ! _nr_validate_segment_response \
         "${segment_headers[i]}" "${segment_metadata[i]}" \
         "${segment_starts[i]}" "${segment_ends[i]}" "$total"; then
         overall=1
       fi
     else
-      printf 'ERROR: URL segment curl command failed.\n' >&2
+      runtime_log_error 'ERROR: URL segment curl command failed.'
       overall=1
     fi
   done
@@ -554,11 +611,10 @@ run_url_download() {
   _nr_cleanup_runtime
 
   if (( overall != 0 )); then
-    printf 'ERROR: one or more URL range segments failed; download aborted.\n' >&2
+    runtime_log_error 'ERROR: one or more URL range segments failed; download aborted.'
     return 1
   fi
-  printf 'URL download complete: total bytes=%s, concurrent segments=%s, transport=%s\n' \
-    "$total" "$segment_count" "$transport"
+  runtime_log_info "URL download complete: total bytes=$total, concurrent segments=$segment_count, transport=$transport"
   return 0
 }
 
@@ -604,7 +660,7 @@ run_cf_speedtest_proxy() {
     return 2
   fi
   if [[ -z ${PROXY_CONFIG:-} ]]; then
-    printf 'WARNING: proxy speed test skipped: PROXY_CONFIG is empty or unset.\n' >&2
+    runtime_log_warning 'WARNING: proxy speed test skipped: PROXY_CONFIG is empty or unset.'
     return 0
   fi
   if [[ $SPEEDTEST_DOWNLOAD_ONLY == true ]]; then
@@ -624,7 +680,7 @@ _nr_validate_full_response() {
   status=${metadata%%$'\t'*}
   size=${metadata#*$'\t'}
   if [[ $status != 2[0-9][0-9] ]]; then
-    printf 'ERROR: complete URL download did not return a successful HTTP status.\n' >&2
+    runtime_log_error 'ERROR: complete URL download did not return a successful HTTP status.'
     return 1
   fi
   printf '%s\n' "$size"

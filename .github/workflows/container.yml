@@ -19,7 +19,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
       - name: Shell syntax checks
-        run: bash -n random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh
+        run: bash -n runtime-log.sh random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_runtime_log.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh
       - name: Run TDD and static contract tests
         run: bash tests/run.sh
 
@@ -42,6 +42,9 @@ jobs:
             set -eu
             test -x /usr/local/bin/random-wait.sh
             test -x /usr/local/bin/network-runtime.sh
+            test -x /usr/local/bin/runtime-log.sh
+            test -s /usr/share/doc/cf_speedtest/LICENSE.txt
+            test -s /usr/share/doc/cf_speedtest/UPSTREAM.json
             test -x "$(command -v curl)"
             test -s /etc/ssl/certs/ca-certificates.crt
             grep -Fq -- "RANDOM_WAIT_PATCH_MARKER: validated random interval seam" /entrypoint.sh
@@ -51,10 +54,65 @@ jobs:
             grep -Fq -- "run_cf_speedtest_proxy" /entrypoint.sh
             help_output=$(cf_speedtest --help 2>&1)
             grep -Fq -- '--download-only' <<<"$help_output"
+            grep -Fq -- '--bytes-to-download' <<<"$help_output"
+            grep -Fq -- '--bytes-to-upload' <<<"$help_output"
           '
+      - name: Hardened cf_speedtest CLI smoke
+        run: |
+          set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
+
+          help_output=$(timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$IMAGE" --help 2>&1)
+          assert_timestamped_logs "$help_output"
+          grep -Fq -- '--bytes-to-download' <<<"$help_output"
+          grep -Fq -- '--bytes-to-upload' <<<"$help_output"
+
+          set +e
+          invalid_output=$(timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$IMAGE" --download-threads 0 2>&1)
+          invalid_rc=$?
+          set -e
+          [ "$invalid_rc" -eq 2 ]
+          assert_timestamped_logs "$invalid_output"
+          if grep -Eq -- '(^|[^[:alpha:]])(DOWN|UP)([^[:alpha:]]|$)|┌' <<<"$invalid_output"; then
+            printf '%s\n' 'unexpected success table in invalid-argument output' >&2
+            exit 1
+          fi
+
+          set +e
+          zero_output=$(timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$IMAGE" --download-only --test-duration-seconds 0 2>&1)
+          zero_rc=$?
+          set -e
+          [ "$zero_rc" -eq 3 ]
+          assert_timestamped_logs "$zero_output"
+          grep -Fq -- 'ERROR: no valid download samples' <<<"$zero_output"
+          if grep -Eq -- '(^|[^[:alpha:]])(DOWN|UP)([^[:alpha:]]|$)|┌' <<<"$zero_output"; then
+            printf '%s\n' 'unexpected success table in zero-sample output' >&2
+            exit 1
+          fi
       - name: Direct URL download smoke
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           url_container="speedtest-diy-url-smoke-${GITHUB_RUN_ID:-local}"
           url_url='https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz'
           summary='URL download complete: total bytes=15152253, concurrent segments=4, transport=direct'
@@ -85,7 +143,7 @@ jobs:
             summary=$2
             while :; do
               url_logs=$(docker logs "$container_name" 2>&1 || true)
-              if [ "$(grep -Fxc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]; then
+              if [ "$(grep -Fc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]; then
                 exit 0
               fi
               sleep 1
@@ -95,7 +153,8 @@ jobs:
           [ "$(docker inspect -f '{{.State.Running}}' "$url_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$url_container")" = 0 ]
           url_logs=$(docker logs "$url_container" 2>&1 || true)
-          [ "$(grep -Fxc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]
+          assert_timestamped_logs "$url_logs"
+          [ "$(grep -Fc -- "$summary" <<<"$url_logs" || true)" -eq 1 ]
           if grep -Fq -- "$url_url" <<<"$url_logs"; then
             printf '%s\n' 'URL appeared in the URL download smoke logs' >&2
             exit 1
@@ -109,6 +168,17 @@ jobs:
       - name: Generated entrypoint download-only smoke
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           fake_root="$RUNNER_TEMP/speedtest-diy-only-down-${GITHUB_RUN_ID:-local}"
           fake_cf="$fake_root/cf_speedtest"
           fake_state="$fake_root/state"
@@ -201,10 +271,22 @@ jobs:
           [ "$(docker inspect -f '{{.State.Running}}' "$only_down_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$only_down_container")" = 0 ]
           only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)
+          assert_timestamped_logs "$only_down_logs"
           grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$only_down_logs"
       - name: Empty proxy speed-test protection smoke
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           empty_proxy_root="$RUNNER_TEMP/speedtest-diy-empty-proxy-${GITHUB_RUN_ID:-local}"
           empty_proxy_fake_cf="$empty_proxy_root/cf_speedtest"
           empty_proxy_state="$empty_proxy_root/state"
@@ -241,7 +323,7 @@ jobs:
             warning=$2
             while :; do
               empty_proxy_logs=$(docker logs "$container_name" 2>&1 || true)
-              if [ "$(grep -Fxc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ] &&
+              if [ "$(grep -Fc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ] &&
                   grep -Fq -- "Waiting 30 seconds before running the tests again..." <<<"$empty_proxy_logs"; then
                 exit 0
               fi
@@ -249,17 +331,29 @@ jobs:
             done
           ' _ "$empty_proxy_container" "$warning"
           empty_proxy_logs=$(docker logs "$empty_proxy_container" 2>&1 || true)
-          [ "$(grep -Fxc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ]
+          [ "$(grep -Fc -- "$warning" <<<"$empty_proxy_logs" || true)" -eq 1 ]
           grep -Fq -- 'Waiting 30 seconds before running the tests again...' <<<"$empty_proxy_logs"
           [ ! -e "$empty_proxy_state/cf.calls" ]
           timeout 10s docker stop --time 5 "$empty_proxy_container"
           [ "$(docker inspect -f '{{.State.Running}}' "$empty_proxy_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$empty_proxy_container")" = 0 ]
           empty_proxy_logs=$(docker logs "$empty_proxy_container" 2>&1 || true)
+          assert_timestamped_logs "$empty_proxy_logs"
           grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$empty_proxy_logs"
       - name: Verify SIGTERM shutdown
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           fake_root="$RUNNER_TEMP/speedtest-diy-defaults-${GITHUB_RUN_ID:-local}"
           fake_cf="$fake_root/cf_speedtest"
           fake_state="$fake_root/state"
@@ -337,6 +431,7 @@ jobs:
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$container_id")" = 0 ]
           [ ! -e "$fake_state/cf.calls" ]
           logs=$(docker logs "$container_id" 2>&1 || true)
+          assert_timestamped_logs "$logs"
           if ! grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$logs"; then
             printf '%s\n' 'missing English shutdown log: Stop requested. Cleaning up and exiting...' >&2
             printf '%s\n' "$logs" >&2
@@ -351,6 +446,17 @@ jobs:
       - name: Verify SIGTERM during initial wait
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           initial_container="speedtest-diy-initial-wait-${GITHUB_RUN_ID:-local}"
           cleanup_initial() {
             docker rm -f "$initial_container" >/dev/null 2>&1 || true
@@ -376,6 +482,7 @@ jobs:
           [ "$(docker inspect -f '{{.State.Running}}' "$initial_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$initial_container")" = 0 ]
           initial_logs=$(docker logs "$initial_container" 2>&1 || true)
+          assert_timestamped_logs "$initial_logs"
           grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$initial_logs"
           if grep -Fq -- 'Arrêt du script demandé.' <<<"$initial_logs"; then
             printf '%s\n' 'unexpected French shutdown log during initial wait' >&2
@@ -437,6 +544,17 @@ jobs:
       - name: Pull, inspect, and run GHCR images anonymously
         run: |
           set -euo pipefail
+          assert_timestamped_logs() {
+            local payload=$1 line count=0
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ -z $line || ! $line =~ ^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\]\ .* ]]; then
+                printf '%s\n' "untimestamped runtime log line: $line" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done <<<"$payload"
+            [ "$count" -gt 0 ]
+          }
           export DOCKER_CONFIG="$RUNNER_TEMP/speedtest-diy-anonymous-docker-config"
           rm -rf -- "$DOCKER_CONFIG"
           mkdir -p -- "$DOCKER_CONFIG"
@@ -469,9 +587,16 @@ jobs:
           docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$sha_image" -c '
             set -eu
             test -x /usr/local/bin/network-runtime.sh
+            test -x /usr/local/bin/runtime-log.sh
+            test -s /usr/share/doc/cf_speedtest/LICENSE.txt
+            test -s /usr/share/doc/cf_speedtest/UPSTREAM.json
             test -x "$(command -v curl)"
             test -s /etc/ssl/certs/ca-certificates.crt
           '
+          public_help=$(timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$sha_image" --help 2>&1)
+          assert_timestamped_logs "$public_help"
+          grep -Fq -- '--bytes-to-download' <<<"$public_help"
+          grep -Fq -- '--bytes-to-upload' <<<"$public_help"
           docker run -d --name "$sha_container" --platform linux/amd64 \
             -e RUN_SPEEDTEST_DIRECT=false \
             -e RUN_SPEEDTEST_PROXY=false \
@@ -496,6 +621,7 @@ jobs:
           [ "$(docker inspect -f '{{.State.Running}}' "$sha_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$sha_container")" = 0 ]
           sha_logs=$(docker logs "$sha_container" 2>&1 || true)
+          assert_timestamped_logs "$sha_logs"
           grep -Fq -- 'Stop requested. Cleaning up and exiting...' <<<"$sha_logs"
           sha_url='https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz'
           summary='URL download complete: total bytes=15152253, concurrent segments=4, transport=direct'
@@ -522,7 +648,7 @@ jobs:
             summary=$2
             while :; do
               sha_url_logs=$(docker logs "$container_name" 2>&1 || true)
-              if [ "$(grep -Fxc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]; then
+              if [ "$(grep -Fc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]; then
                 exit 0
               fi
               sleep 1
@@ -532,7 +658,8 @@ jobs:
           [ "$(docker inspect -f '{{.State.Running}}' "$sha_url_container")" = false ]
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$sha_url_container")" = 0 ]
           sha_url_logs=$(docker logs "$sha_url_container" 2>&1 || true)
-          [ "$(grep -Fxc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]
+          assert_timestamped_logs "$sha_url_logs"
+          [ "$(grep -Fc -- "$summary" <<<"$sha_url_logs" || true)" -eq 1 ]
           if grep -Fq -- "$sha_url" <<<"$sha_url_logs"; then
             printf '%s\n' 'URL appeared in the public URL smoke logs' >&2
             exit 1

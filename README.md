@@ -8,7 +8,7 @@
 - 上游只提供 `linux/amd64`；本项目不宣称支持 arm64。目标运行环境示例为 Debian x86_64。
 - 构建期会校验上游 `/entrypoint.sh` 的 SHA256：`4ce13988639aba6ba591b5025023ef13b8db23490bbfcd96167e492a7f8e1f9d`。上游入口漂移或内容变化时构建 fail-closed，不会静默套用补丁。
 - Compose 默认 `URL_DDL` 固定为 `https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz`。GitHub CLI release `v2.100.0` API 标记为 `immutable`；已核验资产大小为 `15152253` bytes，asset digest 为 `sha256:e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be`，一字节 Range 实测返回 `206`，`Content-Range: bytes 0-0/15152253`。
-- 用户可见自有运行日志统一为英文；第三方命令的输出不翻译。
+- 用户可见自有运行日志统一为英文，并且每一物理行都带 UTC、ISO-8601 毫秒时间戳，例如 `[YYYY-MM-DDTHH:MM:SS.mmmZ]`；第三方命令的输出不翻译。
 
 ## 构建与运行
 
@@ -49,6 +49,15 @@ docker run --rm --platform linux/amd64 --network host \
 - `SPEEDTEST_DOWNLOAD_ONLY=true` 时传给 `cf_speedtest` `--download-only`，且不执行 upload 阶段；该规则同时适用于直连和已配置代理的测速。
 - `UPLOAD_THREADS` 在 only-down 模式下不生效。
 - 直连、代理测速和 URL 下载都使用真实网络流量，请避免在不需要时同时打开多个任务。
+
+### Cloudflare 请求大小、节流与 429
+
+- `SPEEDTEST_DOWNLOAD_BYTES` 和 `SPEEDTEST_UPLOAD_BYTES` 分别控制一次下载或上传的单次 HTTP 请求大小，默认都是 `10485760`（10 MiB），有效范围为 1～2147483647；它们不是整轮测速的总字节数。
+- `DOWNLOAD_THREADS` 仍控制并发，但同一方向的 worker 通过共享请求门控启动，每次实际请求的开始时间至少间隔 250 ms，避免并发瞬时突发。
+- 每次实际请求（包括 429 重试）都生成新的非零 `measId`，不会重复使用失败请求的 ID。
+- HTTP 429 最多重试 2 次，因此总计最多 3 次请求。十进制 `Retry-After` 为 1～30 秒时按该值等待；无效或缺失时依次等待 1 秒、2 秒。`Retry-After` 超过 30 秒时 fail closed 并停止该方向，非 429 不重试。
+- 请求的方向无有效样本时非零退出，且不输出全零测速结果表；已有有效样本后发生终止错误也会非零退出，不把部分结果伪装为成功。
+- 这些措施降低快速重试和大请求触发限流的风险，但不能保证消除服务端限制，仍可能收到 HTTP 429。
 
 ## Compose 仅 URL_DDL 下载
 
@@ -132,6 +141,8 @@ docker run --rm --platform linux/amd64 --network host \
 | `TEST_DURATION` | `10` | `cf_speedtest` 每个方向的测速持续秒数。 |
 | `DOWNLOAD_THREADS` | `4` | 同时控制 `cf_speedtest` 下载线程和 URL 分段连接 worker；范围 1～64。 |
 | `UPLOAD_THREADS` | `4` | `cf_speedtest` 上传线程；only-down 模式下不生效。 |
+| `SPEEDTEST_DOWNLOAD_BYTES` | `10485760`（10 MiB） | `cf_speedtest` 每个下载请求的单次 HTTP 请求字节数；范围 1～2147483647。 |
+| `SPEEDTEST_UPLOAD_BYTES` | `10485760`（10 MiB） | `cf_speedtest` 每个上传请求的单次 HTTP 请求字节数；范围 1～2147483647。 |
 | `SPEEDTEST_DOWNLOAD_ONLY` | `false` | `true` 只执行下载并传入 `--download-only`；false 执行下载和上传。 |
 | `RUN_SPEEDTEST_DIRECT` | `false` | `true` 时运行直连测速。 |
 | `RUN_SPEEDTEST_PROXY` | `false` | `true` 且代理已配置时运行代理测速；代理为空则英文 warning 后跳过。 |

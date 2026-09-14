@@ -44,6 +44,14 @@ require_no_line() {
     fi
 }
 
+require_regex() {
+    local file=$1 pattern=$2 label=$3
+    if ! grep -Eq -- "$pattern" "$file"; then
+        printf 'FAIL: %s (missing regex %s)\n' "$label" "$pattern" >&2
+        return 1
+    fi
+}
+
 extract_job() {
     local file=$1 job_name=$2
     awk -v job="  ${job_name}:" '
@@ -85,8 +93,8 @@ portability_contract() {
 
 workflow_contract() {
     local file=$ROOT/.github/workflows/container.yml
-    local metadata_step metadata_input shell_step image_step url_step only_down_step empty_proxy_step initial_step sigterm_step
-    local shell_input image_input url_input only_down_input empty_proxy_input initial_input sigterm_input
+    local metadata_step metadata_input shell_step image_step hardened_step url_step only_down_step empty_proxy_step initial_step sigterm_step
+    local shell_input image_input hardened_input url_input only_down_input empty_proxy_input initial_input sigterm_input
     require_file "$file" || return 1
 
     require_line "$file" 'name: container' 'workflow name' || return 1
@@ -116,7 +124,7 @@ workflow_contract() {
 
     shell_step=$(extract_step "$file" test 'Shell syntax checks')
     require_line <(printf '%s\n' "$shell_step") \
-        'run: bash -n random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh' \
+        'run: bash -n runtime-log.sh random-wait.sh patch-entrypoint.sh network-runtime.sh tests/run.sh tests/test_runtime_log.sh tests/test_random_wait.sh tests/test_network_runtime.sh tests/test_patch_entrypoint.sh' \
         'shell syntax list includes network runtime files' || return 1
 
     image_step=$(extract_step "$file" build-and-smoke 'Run image smoke checks')
@@ -125,6 +133,9 @@ workflow_contract() {
         'built-image smoke invocation' || return 1
     require_line "$image_input" 'test -x /usr/local/bin/random-wait.sh' 'random helper executable smoke' || return 1
     require_line "$image_input" 'test -x /usr/local/bin/network-runtime.sh' 'network helper executable smoke' || return 1
+    require_line "$image_input" 'test -x /usr/local/bin/runtime-log.sh' 'runtime logger executable smoke' || return 1
+    require_line "$image_input" 'test -s /usr/share/doc/cf_speedtest/LICENSE.txt' 'cf_speedtest license smoke' || return 1
+    require_line "$image_input" 'test -s /usr/share/doc/cf_speedtest/UPSTREAM.json' 'cf_speedtest provenance smoke' || return 1
     require_line "$image_input" 'test -x "$(command -v curl)"' 'curl executable smoke' || return 1
     require_line "$image_input" 'test -s /etc/ssl/certs/ca-certificates.crt' 'CA bundle smoke' || return 1
     require_line "$image_input" "RANDOM_WAIT_PATCH_MARKER: validated random interval seam" 'patched marker smoke' || return 1
@@ -134,6 +145,23 @@ workflow_contract() {
     require_line "$image_input" 'run_cf_speedtest_proxy' 'proxy speedtest marker smoke' || return 1
     require_line "$image_input" 'help_output=$(cf_speedtest --help 2>&1)' 'pinned cf help invocation' || return 1
     require_line "$image_input" "grep -Fq -- '--download-only' <<<\"\$help_output\"" 'download-only help assertion' || return 1
+    require_line "$image_input" "grep -Fq -- '--bytes-to-download' <<<\"\$help_output\"" 'download bytes help assertion' || return 1
+    require_line "$image_input" "grep -Fq -- '--bytes-to-upload' <<<\"\$help_output\"" 'upload bytes help assertion' || return 1
+
+    hardened_step=$(extract_step "$file" build-and-smoke 'Hardened cf_speedtest CLI smoke')
+    hardened_input=$(printf '%s\n' "$hardened_step")
+    require_line "$hardened_input" 'timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$IMAGE" --help' 'bounded hardened help smoke' || return 1
+    require_line "$hardened_input" '--download-threads 0' 'hardened invalid thread smoke' || return 1
+    require_line "$hardened_input" '[ "$invalid_rc" -eq 2 ]' 'hardened invalid exit code' || return 1
+    require_line "$hardened_input" '--download-only --test-duration-seconds 0' 'hardened zero-sample smoke' || return 1
+    require_line "$hardened_input" '[ "$zero_rc" -eq 3 ]' 'hardened zero-sample exit code' || return 1
+    require_line "$hardened_input" 'ERROR: no valid download samples' 'hardened zero-sample diagnosis' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$help_output"' 'hardened help timestamp check' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$invalid_output"' 'hardened invalid timestamp check' || return 1
+    require_line "$hardened_input" 'assert_timestamped_logs "$zero_output"' 'hardened zero-sample timestamp check' || return 1
+    require_line "$hardened_input" "grep -Fq -- '--bytes-to-download'" 'hardened download bytes help check' || return 1
+    require_line "$hardened_input" "grep -Fq -- '--bytes-to-upload'" 'hardened upload bytes help check' || return 1
+    require_line "$hardened_input" 'unexpected success table' 'hardened failure table prohibition' || return 1
 
     url_step=$(extract_step "$file" build-and-smoke 'Direct URL download smoke')
     url_input=$(printf '%s\n' "$url_step")
@@ -157,7 +185,8 @@ workflow_contract() {
     require_line "$url_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$url_container"' 'built-image URL stopped-state check' || return 1
     require_line "$url_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$url_container"' 'built-image URL exit-code check' || return 1
     require_line "$url_input" 'url_logs=$(docker logs "$url_container" 2>&1 || true)' 'built-image URL post-stop log reread' || return 1
-    require_line "$url_input" 'grep -Fxc -- "$summary" <<<"$url_logs"' 'single-line URL summary assertion' || return 1
+    require_line "$url_input" 'grep -Fc -- "$summary" <<<"$url_logs"' 'timestamp-safe URL summary assertion' || return 1
+    require_line "$url_input" 'assert_timestamped_logs "$url_logs"' 'URL log timestamp assertion' || return 1
     if grep -Fq -- '-e WAIT_TIME=1' <<<"$url_input"; then
         printf 'FAIL: built-image URL smoke still uses WAIT_TIME=1\n' >&2
         return 1
@@ -203,6 +232,7 @@ workflow_contract() {
     require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$only_down_container")" = false ]' 'download-only stopped-state assertion' || return 1
     require_line "$only_down_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$only_down_container")" = 0 ]' 'download-only exit code assertion' || return 1
     require_line "$only_down_input" 'only_down_logs=$(docker logs "$only_down_container" 2>&1 || true)' 'download-only post-stop log reread' || return 1
+    require_line "$only_down_input" 'assert_timestamped_logs "$only_down_logs"' 'download-only timestamp assertion' || return 1
     require_line "$only_down_input" 'Stop requested. Cleaning up and exiting...' 'download-only English shutdown assertion' || return 1
     require_line "$only_down_input" 'Arrêt du script demandé.' 'French shutdown prohibition' || return 1
     require_line "$only_down_input" 'rm -rf -- "$fake_root"' 'download-only fake trap cleanup' || return 1
@@ -223,6 +253,7 @@ workflow_contract() {
     require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.Running}}'\'' "$empty_proxy_container")" = false ]' 'empty-proxy stopped-state assertion' || return 1
     require_line "$empty_proxy_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$empty_proxy_container")" = 0 ]' 'empty-proxy exit code assertion' || return 1
     require_line "$empty_proxy_input" 'Stop requested. Cleaning up and exiting...' 'empty-proxy English shutdown assertion' || return 1
+    require_line "$empty_proxy_input" 'assert_timestamped_logs "$empty_proxy_logs"' 'empty-proxy timestamp assertion' || return 1
     require_line "$empty_proxy_input" 'rm -rf -- "$empty_proxy_root"' 'empty-proxy fake trap cleanup' || return 1
 
     sigterm_step=$(extract_step "$file" build-and-smoke 'Verify SIGTERM shutdown')
@@ -245,6 +276,7 @@ workflow_contract() {
     require_line "$sigterm_input" 'Stop requested. Cleaning up and exiting...' 'English shutdown log assertion' || return 1
     require_line "$sigterm_input" 'timeout 10s docker stop --time 5' 'bounded SIGTERM smoke' || return 1
     require_line "$sigterm_input" 'logs=$(docker logs "$container_id" 2>&1 || true)' 'post-stop Docker log reread' || return 1
+    require_line "$sigterm_input" 'assert_timestamped_logs "$logs"' 'default lifecycle timestamp assertion' || return 1
     require_line "$sigterm_input" "docker inspect -f '{{.State.Running}}' \"\$container_id\"" 'post-stop State.Running check' || return 1
     require_line "$sigterm_input" "docker inspect -f '{{.State.ExitCode}}' \"\$container_id\"" 'post-stop ExitCode check' || return 1
     require_line "$sigterm_input" '= false ]' 'post-stop stopped-state assertion' || return 1
@@ -259,6 +291,7 @@ workflow_contract() {
     require_line "$initial_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$initial_container"' 'initial-wait stopped-state assertion' || return 1
     require_line "$initial_input" '[ "$(docker inspect -f '\''{{.State.ExitCode}}'\'' "$initial_container")" = 0 ]' 'initial-wait exit code assertion' || return 1
     require_line "$initial_input" 'initial_logs=$(docker logs "$initial_container" 2>&1 || true)' 'initial-wait post-stop log reread' || return 1
+    require_line "$initial_input" 'assert_timestamped_logs "$initial_logs"' 'initial-wait timestamp assertion' || return 1
     require_line "$initial_input" 'Stop requested. Cleaning up and exiting...' 'initial-wait English shutdown' || return 1
     require_line "$initial_input" 'docker rm -f "$initial_container"' 'initial-wait minimal cleanup' || return 1
 }
@@ -319,6 +352,9 @@ anonymous_ghcr_contract() {
     require_line "$public_input" 'sha_id=$(docker image inspect --format '\''{{.Id}}'\'' "$sha_image")' 'public SHA image inspection' || return 1
     require_line "$public_input" 'docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$sha_image" -c' 'public SHA helper inspection invocation' || return 1
     require_line "$public_input" 'test -x /usr/local/bin/network-runtime.sh' 'public network helper inspection' || return 1
+    require_line "$public_input" 'test -x /usr/local/bin/runtime-log.sh' 'public runtime logger inspection' || return 1
+    require_line "$public_input" 'test -s /usr/share/doc/cf_speedtest/LICENSE.txt' 'public cf license inspection' || return 1
+    require_line "$public_input" 'test -s /usr/share/doc/cf_speedtest/UPSTREAM.json' 'public cf provenance inspection' || return 1
     require_line "$public_input" 'test -x "$(command -v curl)"' 'public curl inspection' || return 1
     require_line "$public_input" 'test -s /etc/ssl/certs/ca-certificates.crt' 'public CA inspection' || return 1
     require_line "$public_input" 'sha_url_container="speedtest-diy-published-sha-url-${GITHUB_RUN_ID:-local}"' 'named published SHA URL container' || return 1
@@ -342,7 +378,13 @@ anonymous_ghcr_contract() {
     require_line "$public_input" 'docker inspect -f '\''{{.State.Running}}'\'' "$sha_url_container"' 'public URL stopped-state assertion' || return 1
     require_line "$public_input" 'docker inspect -f '\''{{.State.ExitCode}}'\'' "$sha_url_container"' 'public URL exit-code assertion' || return 1
     require_line "$public_input" 'sha_url_logs=$(docker logs "$sha_url_container" 2>&1 || true)' 'public URL post-stop log reread' || return 1
-    require_line "$public_input" 'grep -Fxc -- "$summary" <<<"$sha_url_logs"' 'public one-line summary assertion' || return 1
+    require_line "$public_input" 'grep -Fc -- "$summary" <<<"$sha_url_logs"' 'public timestamp-safe summary assertion' || return 1
+    require_line "$public_input" 'timeout 10s docker run --rm --platform linux/amd64 --entrypoint cf_speedtest "$sha_image" --help' 'public hardened binary help smoke' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$public_help"' 'public help timestamp assertion' || return 1
+    require_line "$public_input" "grep -Fq -- '--bytes-to-download' <<<\"\$public_help\"" 'public download bytes help assertion' || return 1
+    require_line "$public_input" "grep -Fq -- '--bytes-to-upload' <<<\"\$public_help\"" 'public upload bytes help assertion' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$sha_logs"' 'public idle log timestamp assertion' || return 1
+    require_line "$public_input" 'assert_timestamped_logs "$sha_url_logs"' 'public URL log timestamp assertion' || return 1
     require_line "$public_input" 'grep -Fq -- "$sha_url" <<<"$sha_url_logs"' 'public URL redaction assertion' || return 1
     require_line "$public_input" "'saved'" 'public progress noise assertion' || return 1
     require_line "$public_input" "'%'" 'public percentage progress noise assertion' || return 1
@@ -367,27 +409,63 @@ anonymous_ghcr_contract() {
         printf 'FAIL: anonymous GHCR job performs a registry login\n' >&2
         return 1
     fi
+    require_no_line "$file" 'speed.cloudflare.com' 'workflow live Cloudflare speed test prohibition' || return 1
 }
 
 dockerfile_contract() {
-    local file=$ROOT/Dockerfile
+    local file=$ROOT/Dockerfile builder_commands command frozen_file
+    local rust_digest='rust:1.87.0-slim-bookworm@sha256:c6d2b4f8115be78af2a07072f61cffbbb4d6c93b55a4712b922fb7391db6a2bc'
+    local runtime_digest='zephir284/speedtest@sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334'
     require_file "$file" || return 1
-    require_line "$file" 'FROM --platform=linux/amd64 zephir284/speedtest@sha256:5b2431c251a10ed6dc6600bba6dcb3ca0b5682b00700c17f1a970478e55a7334' 'frozen amd64 base' || return 1
+    require_line "$file" "FROM --platform=linux/amd64 $rust_digest AS builder" 'frozen amd64 Rust builder' || return 1
+    require_line "$file" "FROM --platform=linux/amd64 $runtime_digest" 'frozen amd64 runtime base' || return 1
+    for frozen_file in \
+        'COPY third_party/cf_speedtest/Cargo.toml' \
+        'COPY third_party/cf_speedtest/Cargo.lock' \
+        'COPY third_party/cf_speedtest/src' \
+        'COPY third_party/cf_speedtest/LICENSE.txt' \
+        'COPY third_party/cf_speedtest/UPSTREAM.json'; do
+        require_line "$file" "$frozen_file" "frozen Rust source copy: $frozen_file" || return 1
+    done
+    require_line "$file" 'cargo fetch --locked' 'locked Rust dependency fetch' || return 1
+    require_regex "$file" 'cargo[[:space:]]+test[^\n]*--locked[^\n]*--offline' 'offline locked Rust tests' || return 1
+    require_regex "$file" 'cargo[[:space:]]+build[^\n]*--locked[^\n]*--offline' 'offline locked Rust build' || return 1
+    builder_commands=$(grep -nE 'cargo[[:space:]]+(test|build)' "$file" || true)
+    while IFS= read -r command; do
+        [ -n "$command" ] || continue
+        case "$command" in
+            *'--offline'*) ;;
+            *)
+                printf 'FAIL: live Rust test/build command is forbidden: %s\n' "$command" >&2
+                return 1
+                ;;
+        esac
+    done <<<"$builder_commands"
+    require_line "$file" 'COPY --from=builder' 'builder artifact copy' || return 1
+    require_regex "$file" '^COPY --from=builder[^\n]*cf_speedtest[^\n]*/usr/local/bin/cf_speedtest' 'runtime cf_speedtest binary path' || return 1
+    require_regex "$file" '^COPY --from=builder[^\n]*LICENSE' 'runtime MIT provenance copy' || return 1
+    require_line "$file" 'cf_speedtest --help' 'final cf_speedtest help check' || return 1
     require_line "$file" 'apt-get update' 'APT package index update' || return 1
     require_line "$file" 'apt-get install -y --no-install-recommends curl ca-certificates' 'curl and CA package install' || return 1
     require_line "$file" 'rm -rf /var/lib/apt/lists/*' 'APT list cleanup' || return 1
+    require_line "$file" 'COPY runtime-log.sh /usr/local/bin/runtime-log.sh' 'runtime logger image copy' || return 1
     require_line "$file" 'COPY random-wait.sh /usr/local/bin/random-wait.sh' 'random helper image copy' || return 1
     require_line "$file" 'COPY network-runtime.sh /usr/local/bin/network-runtime.sh' 'network helper image copy' || return 1
     require_line "$file" 'COPY patch-entrypoint.sh /usr/local/bin/patch-entrypoint.sh' 'patch helper image copy' || return 1
-    require_line "$file" 'chmod 0755 /usr/local/bin/random-wait.sh /usr/local/bin/network-runtime.sh /usr/local/bin/patch-entrypoint.sh' 'runtime helper modes' || return 1
+    require_regex "$file" 'chmod[[:space:]]+0755[^\n]*runtime-log\.sh[^\n]*random-wait\.sh[^\n]*network-runtime\.sh[^\n]*patch-entrypoint\.sh' 'runtime helper modes' || return 1
     require_line "$file" '/usr/local/bin/patch-entrypoint.sh /entrypoint.sh' 'build-time patch' || return 1
     require_line "$file" 'ENTRYPOINT ["/entrypoint.sh"]' 'upstream entrypoint' || return 1
+    if grep -nE 'git[[:space:]]+clone|^[[:space:]]*ADD[[:space:]]+(https?://|git@)|rust(:|[^[:space:]]*:)latest' "$file"; then
+        printf 'FAIL: Dockerfile uses an unfrozen remote/latest builder source\n' >&2
+        return 1
+    fi
     require_no_line "$file" 'arm64' 'Dockerfile architecture scope' || return 1
     if grep -nE '(^|[^[:alnum:]_])eval([[:space:]]|$)' "$file"; then
         printf 'FAIL: Dockerfile contains eval\n' >&2
         return 1
     fi
 }
+
 
 compose_contract() {
     local file=$ROOT/compose.yaml
@@ -408,6 +486,8 @@ compose_contract() {
         '      TEST_DURATION: "${TEST_DURATION:-10}"' \
         '      DOWNLOAD_THREADS: "${DOWNLOAD_THREADS:-4}"' \
         '      UPLOAD_THREADS: "${UPLOAD_THREADS:-4}"' \
+        '      SPEEDTEST_DOWNLOAD_BYTES: "${SPEEDTEST_DOWNLOAD_BYTES:-10485760}"' \
+        '      SPEEDTEST_UPLOAD_BYTES: "${SPEEDTEST_UPLOAD_BYTES:-10485760}"' \
         '      SPEEDTEST_DOWNLOAD_ONLY: "${SPEEDTEST_DOWNLOAD_ONLY:-false}"' \
         '      RUN_SPEEDTEST_DIRECT: "${RUN_SPEEDTEST_DIRECT:-false}"' \
         '      RUN_SPEEDTEST_PROXY: "${RUN_SPEEDTEST_PROXY:-false}"' \
@@ -425,7 +505,7 @@ compose_contract() {
         printf 'FAIL: Compose contract (ports/volumes are forbidden)\n' >&2
         return 1
     fi
-    if grep -nE '^[[:space:]]*-[[:space:]]*(URL_DDL|WAIT_TIME_MIN|WAIT_TIME_MAX|TEST_DURATION|DOWNLOAD_THREADS|UPLOAD_THREADS|SPEEDTEST_DOWNLOAD_ONLY|RUN_SPEEDTEST_DIRECT|RUN_SPEEDTEST_PROXY|PROXY_CONFIG)(:|[[:space:]])' "$file"; then
+    if grep -nE '^[[:space:]]*-[[:space:]]*(URL_DDL|WAIT_TIME_MIN|WAIT_TIME_MAX|TEST_DURATION|DOWNLOAD_THREADS|UPLOAD_THREADS|SPEEDTEST_DOWNLOAD_BYTES|SPEEDTEST_UPLOAD_BYTES|SPEEDTEST_DOWNLOAD_ONLY|RUN_SPEEDTEST_DIRECT|RUN_SPEEDTEST_PROXY|PROXY_CONFIG)(:|[[:space:]])' "$file"; then
         printf 'FAIL: Compose contract (environment must use a mapping)\n' >&2
         return 1
     fi
@@ -457,7 +537,16 @@ documentation_contract() {
     for needle in \
         'WAIT_TIME_MIN' 'WAIT_TIME_MAX' 'WAIT_TIME' 'PROXY_CONFIG' \
         'TEST_DURATION' 'DOWNLOAD_THREADS' 'UPLOAD_THREADS' \
+        'SPEEDTEST_DOWNLOAD_BYTES' 'SPEEDTEST_UPLOAD_BYTES' \
         'SPEEDTEST_DOWNLOAD_ONLY' 'RUN_SPEEDTEST_DIRECT' 'RUN_SPEEDTEST_PROXY' 'URL_DDL' \
+        '10485760' '10 MiB' '1～2147483647' '单次 HTTP 请求' \
+        'measId' '每次实际请求' '429 重试' '非零' \
+        '250 ms' '共享请求门控' \
+        '最多重试 2 次' '总计最多 3 次请求' 'Retry-After' '1～30 秒' \
+        '无效或缺失时依次等待 1 秒、2 秒' '超过 30 秒' 'fail closed' '非 429 不重试' \
+        '无有效样本' '非零退出' '不输出全零测速结果表' '已有有效样本后发生终止错误' \
+        'UTC' 'ISO-8601' '[YYYY-MM-DDTHH:MM:SS.mmmZ]' '每一物理行' \
+        '仍可能收到 HTTP 429' \
         'DOWNLOAD_THREADS` 同时控制 `cf_speedtest` 的下载线程数和 `URL_DDL` 的分段连接 worker 数；有效范围为 1～64。' \
         'N>1` 时先发起 `bytes 0-0` 的一字节 Range probe，再发起互不重叠的 Range 请求覆盖 `byte 1` 到对象末尾。' \
         '`probe` 计入 `byte 0`，所有响应体都写入 `/dev/null`，因此总响应体仍是一个对象。' \
@@ -503,7 +592,8 @@ documentation_contract() {
         '除等待 seam 外' \
         '只在构建期对等待间隔 seam 做精确补丁' \
         'URL_DDL 仍经' \
-        '不能修改为绕过'; do
+        '不能修改为绕过' \
+        '固定 measId=0'; do
         require_no_line "$file" "$obsolete" "README obsolete claim removal" || return 1
     done
 }
@@ -515,9 +605,37 @@ notice_contract() {
     require_line "$file" 'source' 'NOTICE source fact' || return 1
     require_line "$file" '未发现上游许可声明' 'NOTICE license fact' || return 1
     require_line "$file" '自行核对上游条款' 'NOTICE terms reminder' || return 1
+    require_line "$file" '12932/cf_speedtest' 'NOTICE cf_speedtest source' || return 1
+    require_line "$file" '0.5.2' 'NOTICE cf_speedtest version' || return 1
+    require_line "$file" '7824731cc7c448a0cffa12d7a20cd4d7daa25b63' 'NOTICE cf_speedtest commit' || return 1
+    require_line "$file" '69e019aeaca727b9ca485deb11c4bfd1903b4a0b' 'NOTICE cf_speedtest tree' || return 1
+    require_line "$file" 'MIT' 'NOTICE cf_speedtest license' || return 1
+    require_line "$file" '/usr/share/doc/cf_speedtest/LICENSE.txt' 'NOTICE installed license path' || return 1
+    require_line "$file" '不重新授权继承的基础镜像层' 'NOTICE inherited-layer non-relicensing' || return 1
+}
+
+provenance_contract() {
+    python3 - "$ROOT/third_party/cf_speedtest/UPSTREAM.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+assert data.get("receipt_scope") == "pre-change upstream bytes", data.get("receipt_scope")
+assert "files" not in data, "ambiguous top-level files receipt key remains"
+receipts = data.get("upstream_file_receipts_before_local_changes")
+assert isinstance(receipts, dict) and len(receipts) == 9, receipts
+assert data.get("locally_modified_files") == [
+    "src/args.rs",
+    "src/main.rs",
+    "src/tests.rs",
+], data.get("locally_modified_files")
+PY
 }
 
 run_group 'test fixture portability' portability_contract
+run_group 'runtime logger behavior' bash "$ROOT/tests/test_runtime_log.sh"
 run_group 'random wait behavior' bash "$ROOT/tests/test_random_wait.sh"
 run_group 'network runtime behavior' bash "$ROOT/tests/test_network_runtime.sh"
 run_group 'frozen entrypoint patch' bash "$ROOT/tests/test_patch_entrypoint.sh"
@@ -527,6 +645,7 @@ run_group 'Dockerfile static contract' dockerfile_contract
 run_group 'Compose static contract' compose_contract
 run_group 'README static contract' documentation_contract
 run_group 'NOTICE static contract' notice_contract
+run_group 'cf_speedtest provenance contract' provenance_contract
 
 if [ "$failures" -ne 0 ]; then
     printf '%s test groups failed\n' "$failures" >&2

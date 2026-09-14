@@ -4,8 +4,17 @@
 # The upper bound keeps shell sleep/shuf inputs inside a signed 32-bit range.
 RANDOM_WAIT_MAX_SECONDS=2147483647
 
+if ! declare -F runtime_log_error >/dev/null 2>&1 ||
+    ! declare -F runtime_log_info >/dev/null 2>&1; then
+    printf '%s\n' 'random-wait.sh: source runtime-log.sh before random-wait.sh' >&2
+    if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+        exit 1
+    fi
+    return 1
+fi
+
 _random_wait_error() {
-    printf 'random-wait: %s\n' "$*" >&2
+    runtime_log_error "random-wait: $*"
 }
 
 _random_wait_validate_positive_integer() {
@@ -120,6 +129,6 @@ wait_for_next_run() {
     local seconds
 
     seconds=$(sample_wait_seconds) || return 1
-    printf 'Waiting %s seconds before running the tests again...\n' "$seconds"
+    runtime_log_info "Waiting $seconds seconds before running the tests again..." || return 1
     _random_wait_sleep "$seconds"
 }

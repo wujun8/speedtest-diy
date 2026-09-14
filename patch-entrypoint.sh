@@ -62,10 +62,10 @@ AWK_OLD_DOWNLOAD_START_LINE=${OLD_DOWNLOAD_START_LINE//\\/\\\\}
 AWK_OLD_EMPTY_URL_LINE=${OLD_EMPTY_URL_LINE//\\/\\\\}
 AWK_OLD_PROXY_CONFIG_LINE=${OLD_PROXY_CONFIG_LINE//\\/\\\\}
 
-NEW_DIRECT_ERROR='            echo -e "${RED}${BOLD}Error: direct speed test failed${RESET}"'
-NEW_DIRECT_DISABLED='        echo -e "${YELLOW}${BOLD}Direct speed test disabled.${RESET}"'
-NEW_PROXY_ERROR='            echo -e "${RED}${BOLD}Error: proxy speed test failed${RESET}"'
-NEW_PROXY_DISABLED='        echo -e "${YELLOW}${BOLD}Proxy speed test disabled.${RESET}"'
+NEW_DIRECT_ERROR='            runtime_log_error "${RED}${BOLD}Error: direct speed test failed${RESET}"'
+NEW_DIRECT_DISABLED='        runtime_log_warning "${YELLOW}${BOLD}Direct speed test disabled.${RESET}"'
+NEW_PROXY_ERROR='            runtime_log_error "${RED}${BOLD}Error: proxy speed test failed${RESET}"'
+NEW_PROXY_DISABLED='        runtime_log_warning "${YELLOW}${BOLD}Proxy speed test disabled.${RESET}"'
 
 if ! awk \
     -v old_wait_default="$OLD_WAIT_DEFAULT" \
@@ -112,7 +112,7 @@ $0 == old_proxy_config {
     print "        printf \"strict_chain\\nquiet_mode\\nproxy_dns\\nremote_dns_subnet 224\\ntcp_read_time_out 15000\\ntcp_connect_time_out 8000\\n\\n[ProxyList]\\n%s\\n\" \"$PROXY_CONFIG\" > /etc/proxychains4.conf &&"
     print "            chmod 0600 -- /etc/proxychains4.conf"
     print "    ); then"
-    print "        printf " sprintf("%c", 39) "%s\\n" sprintf("%c", 39) " " sprintf("%c", 39) "Error: failed to write proxy configuration." sprintf("%c", 39) " >&2"
+    print "        runtime_log_error \"Error: failed to write proxy configuration.\""
     print "        exit 1"
     print "    fi"
     print "fi"
@@ -120,6 +120,7 @@ $0 == old_proxy_config {
     next
 }
 $0 == old_colors_line {
+    print ". /usr/local/bin/runtime-log.sh"
     print "# RANDOM_WAIT_PATCH_MARKER: validated random interval seam"
     print ". /usr/local/bin/random-wait.sh"
     print ". /usr/local/bin/network-runtime.sh"
@@ -131,6 +132,7 @@ $0 == old_colors_line {
     print "fi"
     print ""
     print
+    logger_source_count++
     source_count++
     network_source_count++
     next
@@ -149,15 +151,15 @@ $0 == old_wait_wait {
     next
 }
 $0 == old_signal_line {
-    print "trap " sprintf("%c", 34) "cancel_network_runtime; echo " sprintf("%c", 39) "Stop requested. Cleaning up and exiting..." sprintf("%c", 39) "; exit 0" sprintf("%c", 34) " SIGTERM SIGINT"
+    print "trap " sprintf("%c", 34) "cancel_network_runtime; runtime_log_info " sprintf("%c", 39) "Stop requested. Cleaning up and exiting..." sprintf("%c", 39) "; exit 0" sprintf("%c", 34) " SIGTERM SIGINT"
     signal_count++
     next
 }
 $0 == old_direct_start {
     print "        if [ \"$SPEEDTEST_DOWNLOAD_ONLY\" = \"true\" ]; then"
-    print "            echo -e \"${GREEN}${BOLD}Starting direct speed test (download-only, ${TEST_DURATION} sec)${RESET}\""
+    print "            runtime_log_info \"${GREEN}${BOLD}Starting direct speed test (download-only, ${TEST_DURATION} sec)${RESET}\""
     print "        else"
-    print "            echo -e \"${GREEN}${BOLD}Starting direct speed test (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
+    print "            runtime_log_info \"${GREEN}${BOLD}Starting direct speed test (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
     print "        fi"
     direct_start_count++
     next
@@ -175,9 +177,9 @@ $0 == old_direct_disabled {
 $0 == old_proxy_start {
     print "        if [ -n \"${PROXY_CONFIG:-}\" ]; then"
     print "            if [ \"$SPEEDTEST_DOWNLOAD_ONLY\" = \"true\" ]; then"
-    print "                echo -e \"${BLUE}${BOLD}Starting speed test through proxychains4 (download-only, ${TEST_DURATION} sec)${RESET}\""
+    print "                runtime_log_info \"${BLUE}${BOLD}Starting speed test through proxychains4 (download-only, ${TEST_DURATION} sec)${RESET}\""
     print "            else"
-    print "                echo -e \"${BLUE}${BOLD}Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
+    print "                runtime_log_info \"${BLUE}${BOLD}Starting speed test through proxychains4 (download and upload, ${TEST_DURATION} sec per direction)${RESET}\""
     print "            fi"
     print "        fi"
     proxy_start_count++
@@ -194,28 +196,28 @@ $0 == old_proxy_disabled {
     next
 }
 $0 == old_download_start_line {
-    print "        echo -e \"${BLUE}${BOLD}Starting URL download...${RESET}\""
+    print "        runtime_log_info \"${BLUE}${BOLD}Starting URL download...${RESET}\""
     download_start_count++
     next
 }
 $0 == old_empty_url_line {
-    print "        echo -e \"${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}\""
+    print "        runtime_log_warning \"${YELLOW}${BOLD}URL_DDL is empty. Download skipped.${RESET}\""
     empty_url_count++
     next
 }
 $0 == old_direct_command {
-    print "        if ! run_cf_speedtest_direct --test-duration-seconds \"$TEST_DURATION\" --download-threads \"$DOWNLOAD_THREADS\" --upload-threads \"$UPLOAD_THREADS\"; then"
+    print "        if ! run_cf_speedtest_direct --test-duration-seconds \"$TEST_DURATION\" --download-threads \"$DOWNLOAD_THREADS\" --upload-threads \"$UPLOAD_THREADS\" --bytes-to-download \"$SPEEDTEST_DOWNLOAD_BYTES\" --bytes-to-upload \"$SPEEDTEST_UPLOAD_BYTES\"; then"
     direct_command_count++
     next
 }
 $0 == old_proxy_command {
-    print "        if ! run_cf_speedtest_proxy --test-duration-seconds \"$TEST_DURATION\" --download-threads \"$DOWNLOAD_THREADS\" --upload-threads \"$UPLOAD_THREADS\"; then"
+    print "        if ! run_cf_speedtest_proxy --test-duration-seconds \"$TEST_DURATION\" --download-threads \"$DOWNLOAD_THREADS\" --upload-threads \"$UPLOAD_THREADS\" --bytes-to-download \"$SPEEDTEST_DOWNLOAD_BYTES\" --bytes-to-upload \"$SPEEDTEST_UPLOAD_BYTES\"; then"
     proxy_command_count++
     next
 }
 $0 == old_url_command {
     print "        if ! run_url_download \"$URL_DDL\"; then"
-    print "            echo -e \"${RED}${BOLD}Error: URL download failed; continuing.${RESET}\""
+    print "            runtime_log_error \"${RED}${BOLD}Error: URL download failed; continuing.${RESET}\""
     print "        fi"
     url_command_count++
     next
@@ -236,14 +238,15 @@ $0 == old_initial_sleep {
     next
 }
 $0 == old_initial {
-    print "echo -e \"${CYAN}${BOLD}Starting in 5 seconds...${RESET}\""
+    print "runtime_log_info \"${CYAN}${BOLD}Starting in 5 seconds...${RESET}\""
     initial_count++
     next
 }
 { print }
 END {
     if (wait_default_count != 1 || proxy_default_count != 1 ||
-        proxy_config_count != 1 || source_count != 1 ||
+        proxy_config_count != 1 || logger_source_count != 1 ||
+        source_count != 1 ||
         network_source_count != 1 || loop_echo_count != 1 ||
         loop_sleep_count != 1 || loop_wait_count != 1 || signal_count != 1 ||
         direct_start_count != 1 || direct_error_count != 1 ||
