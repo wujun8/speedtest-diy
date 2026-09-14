@@ -56,7 +56,9 @@ _nr_pid_running() {
     return 1
   fi
   if [[ -r /proc/$pid/stat ]]; then
-    proc_stat=$(<"/proc/$pid/stat") || return 0
+    if ! IFS= read -r proc_stat 2>/dev/null <"/proc/$pid/stat"; then
+      return 1
+    fi
     proc_stat=${proc_stat##*) }
     state=${proc_stat%% *}
     if [[ $state == Z ]]; then
