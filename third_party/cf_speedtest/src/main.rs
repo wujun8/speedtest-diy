@@ -607,9 +607,10 @@ impl<W: std::io::Write + Send> ThreadSafeLogger<W> {
             return Ok(());
         }
 
-        let mut writer = self.writer.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "logger writer mutex is poisoned")
-        })?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("logger writer mutex is poisoned"))?;
         writer.write_all(formatted.as_bytes())?;
         if !formatted.ends_with('\n') {
             writer.write_all(b"\n")?;
@@ -988,10 +989,8 @@ fn get_download_server_http_latency() -> Result<std::time::Duration> {
     }
 
     latency_vec.into_iter().min().ok_or_else(|| {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Could not measure server latency",
-        )) as Box<dyn std::error::Error>
+        Box::new(std::io::Error::other("Could not measure server latency"))
+            as Box<dyn std::error::Error>
     })
 }
 
@@ -1261,10 +1260,7 @@ fn run_direction_for_runtime<W: std::io::Write + Send + 'static>(
     }
 
     if let Some(error) = join_error {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            error,
-        )));
+        return Err(Box::new(std::io::Error::other(error)));
     }
 
     Ok(state.snapshot())

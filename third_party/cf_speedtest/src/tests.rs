@@ -890,7 +890,7 @@ fn direction_state_counts_only_successful_samples_and_preserves_the_first_termin
         bytes: 7,
         bytes_per_second: 70,
     };
-    let mut state = DirectionState::default();
+    let state = DirectionState::default();
     state.record_sample(first_sample);
     state.record_sample(second_sample);
 
@@ -911,7 +911,7 @@ fn direction_state_counts_only_successful_samples_and_preserves_the_first_termin
         AttemptFailure::Transport,
     ];
     for failure in terminal_failures {
-        let mut failed_state = DirectionState::default();
+        let failed_state = DirectionState::default();
         failed_state.record_terminal_error(failure.clone());
         let failed_snapshot = failed_state.snapshot();
 
@@ -953,7 +953,7 @@ fn direction_run_classification_distinguishes_zero_samples_errors_and_complete_s
         );
     }
 
-    let mut download_with_error = DirectionState::default();
+    let download_with_error = DirectionState::default();
     download_with_error.record_sample(TransferSample {
         bytes: 4,
         bytes_per_second: 40,
@@ -965,7 +965,7 @@ fn direction_run_classification_distinguishes_zero_samples_errors_and_complete_s
         false,
     );
 
-    let mut upload_with_error = DirectionState::default();
+    let upload_with_error = DirectionState::default();
     upload_with_error.record_sample(TransferSample {
         bytes: 5,
         bytes_per_second: 50,
@@ -987,12 +987,12 @@ fn direction_run_classification_distinguishes_zero_samples_errors_and_complete_s
         false,
     );
 
-    let mut successful_download = DirectionState::default();
+    let successful_download = DirectionState::default();
     successful_download.record_sample(TransferSample {
         bytes: 8,
         bytes_per_second: 80,
     });
-    let mut successful_upload = DirectionState::default();
+    let successful_upload = DirectionState::default();
     successful_upload.record_sample(TransferSample {
         bytes: 9,
         bytes_per_second: 90,
@@ -1031,10 +1031,10 @@ fn worker_cycle_composes_shared_gate_and_retry_without_real_sleep() {
         bytes: 16,
         bytes_per_second: 160,
     };
-    let mut state = DirectionState::default();
+    let state = DirectionState::default();
 
     let _ = run_worker_cycle(
-        &mut state,
+        &state,
         &gate,
         |attempt_id| {
             attempt_ids.borrow_mut().push(attempt_id);
@@ -1081,10 +1081,10 @@ fn terminal_worker_cycle_stops_future_cycles_without_issuing_more_requests() {
     let gate = RuntimeRequestGate::new();
     let now_ms = Cell::new(0_u64);
     let first_request_count = Cell::new(0_usize);
-    let mut state = DirectionState::default();
+    let state = DirectionState::default();
 
     let _ = run_worker_cycle(
-        &mut state,
+        &state,
         &gate,
         |_attempt_id| {
             first_request_count.set(first_request_count.get() + 1);
@@ -1107,7 +1107,7 @@ fn terminal_worker_cycle_stops_future_cycles_without_issuing_more_requests() {
 
     let second_request_count = Cell::new(0_usize);
     let _ = run_worker_cycle(
-        &mut state,
+        &state,
         &gate,
         |_attempt_id| {
             second_request_count.set(second_request_count.get() + 1);
@@ -1350,12 +1350,17 @@ fn cancelled_runtime_gate_wait_returns_without_issuing_request_or_spinning() {
 
 #[test]
 fn zero_duration_skips_network_preamble_but_positive_duration_runs_it() {
-    let mut args = UserArgs::default();
-    args.test_duration_seconds = 0;
-    assert!(!should_run_network_preamble(&args));
+    let zero_duration_args = UserArgs {
+        test_duration_seconds: 0,
+        ..UserArgs::default()
+    };
+    assert!(!should_run_network_preamble(&zero_duration_args));
 
-    args.test_duration_seconds = 1;
-    assert!(should_run_network_preamble(&args));
+    let positive_duration_args = UserArgs {
+        test_duration_seconds: 1,
+        ..UserArgs::default()
+    };
+    assert!(should_run_network_preamble(&positive_duration_args));
 }
 
 #[test]
@@ -1474,12 +1479,22 @@ fn run_program_rejects_invalid_thread_or_byte_arguments_with_exit_two() {
     let download = DirectionState::default().snapshot();
     let upload = DirectionState::default().snapshot();
     let (output, logger) = test_logger();
-    let mut args = UserArgs::default();
-    args.download_threads = 0;
-    assert_eq!(run_program(&args, &download, &upload, &logger), 2);
+    let invalid_threads_args = UserArgs {
+        download_threads: 0,
+        ..UserArgs::default()
+    };
+    assert_eq!(
+        run_program(&invalid_threads_args, &download, &upload, &logger),
+        2
+    );
 
-    args = UserArgs::default();
-    args.bytes_to_upload = 0;
-    assert_eq!(run_program(&args, &download, &upload, &logger), 2);
+    let invalid_upload_args = UserArgs {
+        bytes_to_upload: 0,
+        ..UserArgs::default()
+    };
+    assert_eq!(
+        run_program(&invalid_upload_args, &download, &upload, &logger),
+        2
+    );
     assert!(!test_output_text(&output).contains("90th pctile"));
 }
