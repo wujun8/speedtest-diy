@@ -630,6 +630,42 @@ runtime_text=$(<"$RUNTIME")
 assert_not_contains "$runtime_text" 'wget' 'production helper still references wget'
 pass 'source is inert, preserves shell options, and is curl-only'
 
+# A child can exit after the /proc readability check but before stat is opened.
+# The helper must report it stopped without leaking a raw shell diagnostic.
+(
+  PROC_RACE_MARKER="$STATE/proc-stat-race.triggered"
+  PROC_RACE_STDOUT="$STATE/proc-stat-race.out"
+  PROC_RACE_STDERR="$STATE/proc-stat-race.err"
+  sleep 60 &
+  PROC_RACE_PID=$!
+
+  proc_race_debug_hook() {
+    if [[ $BASH_COMMAND == *'/proc/$pid/stat'* && $BASH_COMMAND != '[['* ]]; then
+      trap - DEBUG
+      : > "$PROC_RACE_MARKER"
+      kill -KILL "$PROC_RACE_PID" 2>/dev/null || :
+      wait "$PROC_RACE_PID" 2>/dev/null || :
+    fi
+  }
+
+  set -T
+  trap proc_race_debug_hook DEBUG
+  set +e
+  _nr_pid_running "$PROC_RACE_PID" >"$PROC_RACE_STDOUT" 2>"$PROC_RACE_STDERR"
+  proc_race_rc=$?
+  set -e
+  trap - DEBUG
+  set +T
+  kill -KILL "$PROC_RACE_PID" 2>/dev/null || :
+  wait "$PROC_RACE_PID" 2>/dev/null || :
+
+  [[ -f $PROC_RACE_MARKER ]] || fail 'deterministic /proc disappearance hook did not run'
+  assert_eq '1' "$proc_race_rc" '/proc disappearance was reported as a live process'
+  assert_eq '' "$(<"$PROC_RACE_STDOUT")" '/proc disappearance wrote stdout'
+  assert_eq '' "$(<"$PROC_RACE_STDERR")" '/proc disappearance leaked an un-timestamped shell diagnostic'
+)
+pass '/proc disappearance race is silent and reports the process stopped'
+
 # Internal machine-readable values stay undecorated even when user logs use the logger.
 normalized=$(_nr_normalize_decimal 00000042)
 assert_eq '42' "$normalized" 'decimal normalizer added a log prefix'
